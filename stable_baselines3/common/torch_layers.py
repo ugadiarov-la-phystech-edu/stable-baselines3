@@ -90,7 +90,8 @@ class NatureCNN(BaseFeaturesExtractor):
         self.linear = nn.Sequential(nn.Linear(n_flatten, features_dim), nn.ReLU())
 
     def forward(self, observations: th.Tensor) -> th.Tensor:
-        return self.linear(self.cnn(observations))
+        cnn_out = self.cnn(observations)
+        return self.linear(cnn_out), cnn_out
 
 
 def create_mlp(

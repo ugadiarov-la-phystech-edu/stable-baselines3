@@ -556,7 +556,19 @@ class ActorCriticPolicy(BasePolicy):
         else:
             raise NotImplementedError(f"Unsupported distribution '{self.action_dist}'.")
 
-        self.value_net = nn.Linear(self.mlp_extractor.latent_dim_vf, 1)
+        self.value_net = nn.Sequential(
+            nn.Linear(1024, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 1)
+        )
         # Init weights: use orthogonal initialization
         # with small initial weight for the output
         if self.ortho_init:
@@ -585,10 +597,10 @@ class ActorCriticPolicy(BasePolicy):
         :return: action, value and log probability of the action
         """
         # Preprocess the observation if needed
-        features = self.extract_features(obs)
+        features, cnn_out = self.extract_features(obs)
         latent_pi, latent_vf = self.mlp_extractor(features)
         # Evaluate the values for the given observations
-        values = self.value_net(latent_vf)
+        values = self.value_net(cnn_out)
         distribution = self._get_action_dist_from_latent(latent_pi)
         actions = distribution.get_actions(deterministic=deterministic)
         log_prob = distribution.log_prob(actions)
@@ -640,11 +652,11 @@ class ActorCriticPolicy(BasePolicy):
             and entropy of the action distribution.
         """
         # Preprocess the observation if needed
-        features = self.extract_features(obs)
+        features, cnn_out = self.extract_features(obs)
         latent_pi, latent_vf = self.mlp_extractor(features)
         distribution = self._get_action_dist_from_latent(latent_pi)
         log_prob = distribution.log_prob(actions)
-        values = self.value_net(latent_vf)
+        values = self.value_net(cnn_out)
         return values, log_prob, distribution.entropy()
 
     def get_distribution(self, obs: th.Tensor) -> Distribution:
@@ -665,9 +677,9 @@ class ActorCriticPolicy(BasePolicy):
         :param obs:
         :return: the estimated values.
         """
-        features = self.extract_features(obs)
+        features, cnn_out = self.extract_features(obs)
         latent_vf = self.mlp_extractor.forward_critic(features)
-        return self.value_net(latent_vf)
+        return self.value_net(cnn_out)
 
 
 class ActorCriticCnnPolicy(ActorCriticPolicy):
