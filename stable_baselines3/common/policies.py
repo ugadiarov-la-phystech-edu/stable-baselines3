@@ -828,7 +828,7 @@ class ActorCriticCnnTreeQNPolicy(ActorCriticPolicy):
             "gamma": 0.99,
             "predict_rewards": True,
             "value_aggregation": 'softmax',
-            "td_lambda": 0.95,
+            "td_lambda": 0.8,
             "normalise_state": True,
         }
 
