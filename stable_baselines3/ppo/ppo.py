@@ -10,6 +10,7 @@ from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import explained_variance, get_schedule_fn
+from stable_baselines3.treeqn.utils.treeqn_utils import get_paths
 
 
 class PPO(OnPolicyAlgorithm):
@@ -91,6 +92,9 @@ class PPO(OnPolicyAlgorithm):
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
+        use_reward_loss: bool = True,
+        reward_loss_coef: float = 0.5,
+        target_update_interval: int = 20000
     ):
 
         super(PPO, self).__init__(
@@ -119,6 +123,11 @@ class PPO(OnPolicyAlgorithm):
                 spaces.MultiBinary,
             ),
         )
+
+        self.use_reward_loss = use_reward_loss
+        self.reward_loss_coef = reward_loss_coef
+        self.target_update_interval = target_update_interval
+        self.target_update_timestep = target_update_interval
 
         # Sanity check, otherwise it will lead to noisy gradient and NaN
         # because of the advantage normalization
@@ -183,6 +192,7 @@ class PPO(OnPolicyAlgorithm):
         entropy_losses = []
         pg_losses, value_losses = [], []
         clip_fractions = []
+        reward_losses = []
 
         continue_training = True
 
@@ -200,10 +210,16 @@ class PPO(OnPolicyAlgorithm):
                 if self.use_sde:
                     self.policy.reset_noise(self.batch_size)
 
-                values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
-                values = values.flatten()
+                evaluation_results = self.policy.evaluate_actions(rollout_data.observations, actions)
+                if self.use_reward_loss:
+                    values, log_prob, entropy, tree_result = evaluation_results
+                    advantages = rollout_data.old_values
+                else:
+                    values, log_prob, entropy = evaluation_results
+                    values = values.flatten()
+                    advantages = rollout_data.advantages
+
                 # Normalize advantage
-                advantages = rollout_data.advantages
                 if self.normalize_advantage:
                     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
@@ -244,6 +260,19 @@ class PPO(OnPolicyAlgorithm):
 
                 loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
 
+                if self.use_reward_loss:
+                    r_taken = get_paths(
+                        tree_result["rewards"],
+                        rollout_data.action_sequences.long().squeeze(-1),
+                        rollout_data.action_sequences.shape[0],
+                        self.action_space.n
+                    )
+                    sequence_mask = rollout_data.sequence_mask.squeeze(-1)
+                    reward_loss = F.mse_loss(th.cat(r_taken, 1), rollout_data.reward_sequences.squeeze(-1), reduce=False)
+                    reward_loss = th.sum(reward_loss * sequence_mask) / sequence_mask.sum()
+                    reward_losses.append(reward_loss.item())
+                    loss = loss + self.reward_loss_coef * reward_loss
+
                 # Calculate approximate form of reverse KL Divergence for early stopping
                 # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
                 # and discussion in PR #419: https://github.com/DLR-RM/stable-baselines3/pull/419
@@ -269,6 +298,10 @@ class PPO(OnPolicyAlgorithm):
             if not continue_training:
                 break
 
+        if self.use_reward_loss and self.num_timesteps >= self.target_update_timestep:
+            self.target_update_timestep += self.target_update_interval
+            self.policy.update_target()
+
         self._n_updates += self.n_epochs
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
@@ -276,6 +309,8 @@ class PPO(OnPolicyAlgorithm):
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
         self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
         self.logger.record("train/value_loss", np.mean(value_losses))
+        if self.use_reward_loss:
+            self.logger.record("train/reward_loss", np.mean(reward_losses))
         self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
         self.logger.record("train/clip_fraction", np.mean(clip_fractions))
         self.logger.record("train/loss", loss.item())

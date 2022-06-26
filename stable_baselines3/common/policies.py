@@ -841,6 +841,12 @@ class ActorCriticCnnTreeQNPolicy(ActorCriticPolicy):
 
         self.value_net = policy(observation_space, action_space)
         self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
+        self.target_value_net = copy.deepcopy(self.value_net)
+        self.update_target()
+
+    def update_target(self):
+        self.target_value_net.load_state_dict(self.value_net.state_dict())
+        self.target_value_net.requires_grad_(False)
 
     def forward(self, obs: th.Tensor, deterministic: bool = False) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
@@ -854,11 +860,11 @@ class ActorCriticCnnTreeQNPolicy(ActorCriticPolicy):
         features = self.extract_features(obs)
         latent_pi, latent_vf = self.mlp_extractor(features)
         # Evaluate the values for the given observations
-        values = self.value_net.value(obs)
+        Q, V, tree_result = self.value_net(obs)
         distribution = self._get_action_dist_from_latent(latent_pi)
         actions = distribution.get_actions(deterministic=deterministic)
         log_prob = distribution.log_prob(actions)
-        return actions, values, log_prob
+        return actions, Q.gather(1, actions.unsqueeze(1)).squeeze(), log_prob
 
     def evaluate_actions(self, obs: th.Tensor, actions: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
@@ -875,8 +881,8 @@ class ActorCriticCnnTreeQNPolicy(ActorCriticPolicy):
         latent_pi, latent_vf = self.mlp_extractor(features)
         distribution = self._get_action_dist_from_latent(latent_pi)
         log_prob = distribution.log_prob(actions)
-        values = self.value_net.value(obs)
-        return values, log_prob, distribution.entropy()
+        Q, _, tree_results = self.value_net(obs)
+        return Q.gather(1, actions.unsqueeze(1)).squeeze(), log_prob, distribution.entropy(), tree_results
 
     def predict_values(self, obs: th.Tensor) -> th.Tensor:
         """
@@ -885,7 +891,7 @@ class ActorCriticCnnTreeQNPolicy(ActorCriticPolicy):
         :param obs:
         :return: the estimated values.
         """
-        return self.value_net.value(obs)
+        return self.target_value_net.value(obs)
 
 
 class MultiInputActorCriticPolicy(ActorCriticPolicy):
