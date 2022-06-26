@@ -191,7 +191,6 @@ class PPO(OnPolicyAlgorithm):
 
         entropy_losses = []
         pg_losses, value_losses = [], []
-        clip_fractions = []
         reward_losses = []
 
         continue_training = True
@@ -211,30 +210,9 @@ class PPO(OnPolicyAlgorithm):
                     self.policy.reset_noise(self.batch_size)
 
                 evaluation_results = self.policy.evaluate_actions(rollout_data.observations, actions)
-                if self.use_reward_loss:
-                    values, log_prob, entropy, tree_result = evaluation_results
-                    advantages = rollout_data.old_values
-                else:
-                    values, log_prob, entropy = evaluation_results
-                    values = values.flatten()
-                    advantages = rollout_data.advantages
-
-                # Normalize advantage
-                if self.normalize_advantage:
-                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-                # ratio between old and new policy, should be one at the first iteration
-                ratio = th.exp(log_prob - rollout_data.old_log_prob)
-
-                # clipped surrogate loss
-                policy_loss_1 = advantages * ratio
-                policy_loss_2 = advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
-                policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
-
-                # Logging
+                values, log_prob, entropy, tree_result, probs = evaluation_results
+                policy_loss = -th.mean(th.sum(probs * rollout_data.q_values, dim=1))
                 pg_losses.append(policy_loss.item())
-                clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float()).item()
-                clip_fractions.append(clip_fraction)
 
                 if self.clip_range_vf is None:
                     # No clipping
@@ -312,7 +290,6 @@ class PPO(OnPolicyAlgorithm):
         if self.use_reward_loss:
             self.logger.record("train/reward_loss", np.mean(reward_losses))
         self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
-        self.logger.record("train/clip_fraction", np.mean(clip_fractions))
         self.logger.record("train/loss", loss.item())
         self.logger.record("train/explained_variance", explained_var)
         if hasattr(self.policy, "log_std"):

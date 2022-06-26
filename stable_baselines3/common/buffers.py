@@ -348,6 +348,7 @@ class RolloutBuffer(BaseBuffer):
         self.action_sequences = None
         self.reward_sequences = None
         self.sequence_mask = None
+        self.q_values = None
         self.generator_ready = False
         self.tree_depth = tree_depth
         self.reset()
@@ -362,6 +363,7 @@ class RolloutBuffer(BaseBuffer):
         self.values = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.log_probs = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.advantages = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.q_values = np.zeros((self.buffer_size, self.n_envs, self.action_space.n), dtype=np.float32)
         self.action_sequences = None
         self.reward_sequences = None
         self.sequence_mask = None
@@ -452,6 +454,7 @@ class RolloutBuffer(BaseBuffer):
         episode_start: np.ndarray,
         value: th.Tensor,
         log_prob: th.Tensor,
+        q_values: th.Tensor
     ) -> None:
         """
         :param obs: Observation
@@ -478,6 +481,7 @@ class RolloutBuffer(BaseBuffer):
         self.episode_starts[self.pos] = np.array(episode_start).copy()
         self.values[self.pos] = value.clone().cpu().numpy().flatten()
         self.log_probs[self.pos] = log_prob.clone().cpu().numpy()
+        self.q_values[self.pos] = q_values.clone().cpu().numpy()
         self.pos += 1
         if self.pos == self.buffer_size:
             self.full = True
@@ -498,7 +502,8 @@ class RolloutBuffer(BaseBuffer):
                 "rewards",
                 "action_sequences",
                 "reward_sequences",
-                "sequence_mask"
+                "sequence_mask",
+                "q_values",
             ]
 
             for tensor in _tensor_names:
@@ -525,7 +530,8 @@ class RolloutBuffer(BaseBuffer):
             self.rewards[batch_inds].flatten(),
             self.action_sequences[batch_inds],
             self.reward_sequences[batch_inds],
-            self.sequence_mask[batch_inds]
+            self.sequence_mask[batch_inds],
+            self.q_values[batch_inds],
         )
         return RolloutBufferSamples(*tuple(map(self.to_torch, data)))
 

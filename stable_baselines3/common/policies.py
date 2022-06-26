@@ -864,7 +864,7 @@ class ActorCriticCnnTreeQNPolicy(ActorCriticPolicy):
         distribution = self._get_action_dist_from_latent(latent_pi)
         actions = distribution.get_actions(deterministic=deterministic)
         log_prob = distribution.log_prob(actions)
-        return actions, Q.gather(1, actions.unsqueeze(1)).squeeze(), log_prob
+        return actions, V, log_prob, Q
 
     def evaluate_actions(self, obs: th.Tensor, actions: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
@@ -882,7 +882,7 @@ class ActorCriticCnnTreeQNPolicy(ActorCriticPolicy):
         distribution = self._get_action_dist_from_latent(latent_pi)
         log_prob = distribution.log_prob(actions)
         Q, _, tree_results = self.value_net(obs)
-        return Q.gather(1, actions.unsqueeze(1)).squeeze(), log_prob, distribution.entropy(), tree_results
+        return Q.gather(1, actions.unsqueeze(1)).squeeze(), log_prob, distribution.entropy(), tree_results, distribution.distribution.probs
 
     def predict_values(self, obs: th.Tensor) -> th.Tensor:
         """
