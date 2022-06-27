@@ -28,6 +28,9 @@ class RolloutBufferSamples(NamedTuple):
     old_log_prob: th.Tensor
     advantages: th.Tensor
     returns: th.Tensor
+    action_sequences: th.Tensor
+    reward_sequences: th.Tensor
+    sequence_mask: th.Tensor
 
 
 class DictRolloutBufferSamples(RolloutBufferSamples):

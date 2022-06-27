@@ -875,8 +875,8 @@ class ActorCriticCnnTreeQNPolicy(ActorCriticPolicy):
         latent_pi, latent_vf = self.mlp_extractor(features)
         distribution = self._get_action_dist_from_latent(latent_pi)
         log_prob = distribution.log_prob(actions)
-        values = self.value_net.value(obs)
-        return values, log_prob, distribution.entropy()
+        Q, values, tree_results = self.value_net(obs)
+        return values.unsqueeze(1), log_prob, distribution.entropy(), tree_results
 
     def predict_values(self, obs: th.Tensor) -> th.Tensor:
         """
