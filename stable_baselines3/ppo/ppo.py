@@ -298,7 +298,7 @@ class PPO(OnPolicyAlgorithm):
 
             collect_rollout_statistics = False
 
-        if self.num_timesteps >= self.target_update_timestep:
+        if self.target_update_timestep is not None and self.num_timesteps >= self.target_update_timestep:
             self.target_update_timestep += self.target_update_interval
             self.policy.update_target()
 
