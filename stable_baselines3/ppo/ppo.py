@@ -217,7 +217,11 @@ class PPO(OnPolicyAlgorithm):
 
                 evaluation_results = self.policy.evaluate_actions(rollout_data.observations, actions)
                 values, log_prob, entropy, tree_result, probs = evaluation_results
-                policy_loss = -th.mean(th.sum(probs * rollout_data.q_values, dim=1))
+                # Normalize advantage
+                advantages = rollout_data.q_values
+                if self.normalize_advantage:
+                    advantages = (advantages - advantages.mean(dim=0)) / (advantages.std(dim=0) + 1e-8)
+                policy_loss = -th.mean(th.sum(probs * advantages, dim=1))
                 pg_losses.append(policy_loss.item())
 
                 if self.clip_range_vf is None:
@@ -322,7 +326,7 @@ class PPO(OnPolicyAlgorithm):
         for action in range(actions_taken.shape[0]):
             self.logger.record(f"train/action_{action}", actions_taken[action])
         for action in range(actions_probs.shape[0]):
-            self.logger.record(f"train/action_{action}_prob", actions_probs[action])
+            self.logger.record(f"train/action-prob_{action}", actions_probs[action])
         for action in range(q_values.shape[0]):
             self.logger.record(f"train/q_value_{action}", q_values[action])
         self.logger.record("train/q_values_taken", q_values_taken)
