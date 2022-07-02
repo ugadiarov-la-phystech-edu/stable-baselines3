@@ -94,7 +94,8 @@ class PPO(OnPolicyAlgorithm):
         _init_setup_model: bool = True,
         use_reward_loss: bool = True,
         reward_loss_coef: float = 0.5,
-        target_update_interval: int = 1000
+        target_update_interval: int = 1000,
+        pg_coef: float = 1.0
     ):
 
         super(PPO, self).__init__(
@@ -128,6 +129,7 @@ class PPO(OnPolicyAlgorithm):
         self.reward_loss_coef = reward_loss_coef
         self.target_update_interval = target_update_interval
         self.target_update_timestep = target_update_interval
+        self.pg_coef = pg_coef
 
         # Sanity check, otherwise it will lead to noisy gradient and NaN
         # because of the advantage normalization
@@ -246,7 +248,7 @@ class PPO(OnPolicyAlgorithm):
 
                 entropy_losses.append(entropy_loss.item())
 
-                loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+                loss = self.pg_coef * policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
 
                 if collect_rollout_statistics:
                     for action, count in zip(*np.unique(actions.cpu().numpy(), return_counts=True)):
