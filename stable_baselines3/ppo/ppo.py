@@ -94,7 +94,7 @@ class PPO(OnPolicyAlgorithm):
         _init_setup_model: bool = True,
         use_reward_loss: bool = True,
         reward_loss_coef: float = 0.5,
-        target_update_interval: int = 20000
+        target_update_interval: int = 1000
     ):
 
         super(PPO, self).__init__(
@@ -192,8 +192,14 @@ class PPO(OnPolicyAlgorithm):
         entropy_losses = []
         pg_losses, value_losses = [], []
         reward_losses = []
+        actions_taken = np.zeros(self.action_space.n, dtype=np.float32)
+        actions_probs = np.zeros(self.action_space.n, dtype=np.float32)
+        q_values = []
+        q_values_taken = []
+        returns = []
 
         continue_training = True
+        collect_rollout_statistics = True
 
         # train for n_epochs epochs
         for epoch in range(self.n_epochs):
@@ -211,7 +217,11 @@ class PPO(OnPolicyAlgorithm):
 
                 evaluation_results = self.policy.evaluate_actions(rollout_data.observations, actions)
                 values, log_prob, entropy, tree_result, probs = evaluation_results
-                policy_loss = -th.mean(th.sum(probs * rollout_data.q_values, dim=1))
+                # Normalize advantage
+                advantages = rollout_data.q_values
+                if self.normalize_advantage:
+                    advantages = (advantages - advantages.mean(dim=0)) / (advantages.std(dim=0) + 1e-8)
+                policy_loss = -th.mean(th.sum(probs * advantages, dim=1))
                 pg_losses.append(policy_loss.item())
 
                 if self.clip_range_vf is None:
@@ -237,6 +247,16 @@ class PPO(OnPolicyAlgorithm):
                 entropy_losses.append(entropy_loss.item())
 
                 loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+
+                if collect_rollout_statistics:
+                    for action, count in zip(*np.unique(actions.cpu().numpy(), return_counts=True)):
+                        actions_taken[action] += count
+
+                    actions_probs += th.sum(probs, dim=0).detach().cpu().numpy()
+                    q_values.append((th.sum(rollout_data.q_values, dim=0).detach().cpu().numpy(), rollout_data.q_values.shape[0]))
+                    q_values_taken.append((th.sum(values).item(), values.shape[0]))
+                    returns.append((th.sum(rollout_data.returns).item(), rollout_data.returns.shape[0]))
+
 
                 if self.use_reward_loss:
                     r_taken = get_paths(
@@ -276,9 +296,17 @@ class PPO(OnPolicyAlgorithm):
             if not continue_training:
                 break
 
-        if self.use_reward_loss and self.num_timesteps >= self.target_update_timestep:
+            collect_rollout_statistics = False
+
+        if self.num_timesteps >= self.target_update_timestep:
             self.target_update_timestep += self.target_update_interval
             self.policy.update_target()
+
+        actions_taken /= actions_taken.sum()
+        actions_probs /= actions_probs.sum()
+        q_values = sum(values for values, counts in q_values) / sum(counts for values, counts in q_values)
+        q_values_taken = sum(values for values, counts in q_values_taken) / sum(counts for values, counts in q_values_taken)
+        returns = sum(values for values, counts in returns) / sum(counts for values, counts in returns)
 
         self._n_updates += self.n_epochs
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
@@ -294,6 +322,15 @@ class PPO(OnPolicyAlgorithm):
         self.logger.record("train/explained_variance", explained_var)
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
+
+        for action in range(actions_taken.shape[0]):
+            self.logger.record(f"train/action_{action}", actions_taken[action])
+        for action in range(actions_probs.shape[0]):
+            self.logger.record(f"train/action-prob_{action}", actions_probs[action])
+        for action in range(q_values.shape[0]):
+            self.logger.record(f"train/q_value_{action}", q_values[action])
+        self.logger.record("train/q_values_taken", q_values_taken)
+        self.logger.record("train/returns", returns)
 
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         self.logger.record("train/clip_range", clip_range)
