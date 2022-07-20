@@ -593,8 +593,8 @@ class ActorCriticPolicy(BasePolicy):
         latent_pi, latent_vf = self.mlp_extractor(features)
         # Evaluate the values for the given observations
         values = self.value_net(latent_vf)
-        V = th.max(values, 1)[0]
         distribution = self._get_action_dist_from_latent(latent_pi)
+        V = th.sum(values * distribution.distribution.probs, dim=-1)
         actions = distribution.get_actions(deterministic=deterministic)
         log_prob = distribution.log_prob(actions)
         return actions, V, log_prob, values
@@ -670,9 +670,8 @@ class ActorCriticPolicy(BasePolicy):
         :param obs:
         :return: the estimated values.
         """
-        features = self.extract_features(obs)
-        latent_vf = self.mlp_extractor.forward_critic(features)
-        return th.max(self.value_net(latent_vf), 1)[0].unsqueeze(1)
+        actions, V, log_prob, values = self(obs)
+        return V.unsqueeze(1)
 
 
 class ActorCriticCnnPolicy(ActorCriticPolicy):
@@ -750,6 +749,9 @@ class ActorCriticCnnPolicy(ActorCriticPolicy):
             optimizer_kwargs,
             q_critic
         )
+
+
+TARGET = None
 
 
 class ActorCriticCnnTreeQNPolicy(ActorCriticPolicy):
@@ -848,12 +850,20 @@ class ActorCriticCnnTreeQNPolicy(ActorCriticPolicy):
 
         self.value_net = policy(observation_space, action_space)
         self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
-        self.target_value_net = copy.deepcopy(self.value_net)
+
+        global TARGET
+        TARGET = copy.deepcopy(self).to('cuda')
         self.update_target()
 
     def update_target(self):
-        self.target_value_net.load_state_dict(self.value_net.state_dict())
-        self.target_value_net.requires_grad_(False)
+        global TARGET
+        TARGET.load_state_dict(self.state_dict())
+        TARGET.requires_grad_(False)
+
+    def _get_distribution(self, obs: th.Tensor):
+        features = self.extract_features(obs)
+        latent_pi, latent_vf = self.mlp_extractor(features)
+        return self._get_action_dist_from_latent(latent_pi)
 
     def forward(self, obs: th.Tensor, deterministic: bool = False) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
@@ -863,12 +873,11 @@ class ActorCriticCnnTreeQNPolicy(ActorCriticPolicy):
         :param deterministic: Whether to sample or use deterministic actions
         :return: action, value and log probability of the action
         """
-        # Preprocess the observation if needed
-        features = self.extract_features(obs)
-        latent_pi, latent_vf = self.mlp_extractor(features)
+        V = self.predict_values(obs)
+
         # Evaluate the values for the given observations
-        Q, V, tree_result = self.value_net(obs)
-        distribution = self._get_action_dist_from_latent(latent_pi)
+        distribution = self._get_distribution(obs)
+        Q, _, _ = self.value_net(obs)
         actions = distribution.get_actions(deterministic=deterministic)
         log_prob = distribution.log_prob(actions)
         return actions, V, log_prob, Q
@@ -898,7 +907,12 @@ class ActorCriticCnnTreeQNPolicy(ActorCriticPolicy):
         :param obs:
         :return: the estimated values.
         """
-        return self.target_value_net.value(obs)
+        global TARGET
+        distribution_target = TARGET._get_distribution(obs)
+        Q_target, _, _ = TARGET.value_net(obs)
+        V = th.sum(Q_target * distribution_target.distribution.probs, dim=-1)
+
+        return V
 
 
 class ActorCriticCnnMacPolicy(ActorCriticPolicy):
