@@ -219,9 +219,8 @@ class PPO(OnPolicyAlgorithm):
                 values, log_prob, entropy, tree_result, probs = evaluation_results
                 # Normalize advantage
                 advantages = rollout_data.q_values
-                if self.normalize_advantage:
-                    advantages = (advantages - advantages.mean(dim=0)) / (advantages.std(dim=0) + 1e-8)
-                policy_loss = -th.mean(th.sum(probs * advantages, dim=1))
+                norm_advantages = (advantages - advantages.mean(dim=0)) / (advantages.std(dim=0) + 1e-8)
+                policy_loss = -0.5 * th.mean(th.sum(probs * (advantages + norm_advantages), dim=1))
                 pg_losses.append(policy_loss.item())
 
                 if self.clip_range_vf is None:
