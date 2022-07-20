@@ -891,7 +891,7 @@ class ActorCriticCnnTreeQNPolicy(ActorCriticPolicy):
         :param obs:
         :return: the estimated values.
         """
-        return self.target_value_net.value(obs)
+        return self.value_net.value(obs)
 
 
 class MultiInputActorCriticPolicy(ActorCriticPolicy):
