@@ -827,7 +827,7 @@ class ActorCriticCnnTreeQNPolicy(ActorCriticPolicy):
             "input_mode": 'atari',
             "gamma": 0.99,
             "predict_rewards": True,
-            "value_aggregation": 'softmax',
+            "value_aggregation": 'actor',
             "td_lambda": 0.95,
             "normalise_state": True,
         }
@@ -842,11 +842,42 @@ class ActorCriticCnnTreeQNPolicy(ActorCriticPolicy):
         self.value_net = policy(observation_space, action_space)
         self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
         self.target_value_net = copy.deepcopy(self.value_net)
+        self.target_action_net = copy.deepcopy(self.action_net)
         self.update_target()
+        self.value_net.get_probs = lambda x: self.get_probs(x, is_target_net=False)
+        self.target_value_net.get_probs = lambda x: self.get_probs(x, is_target_net=True)
+
+    def get_probs(self, latent_pi: th.Tensor, is_target_net):
+        if is_target_net:
+            return self._get_action_dist_from_latent_target(latent_pi).distribution.probs
+
+        return self._get_action_dist_from_latent(latent_pi).distribution.probs
+
+    def _get_action_dist_from_latent_target(self, latent_pi: th.Tensor):
+        mean_actions = self.target_action_net(latent_pi)
+
+        if isinstance(self.action_dist, DiagGaussianDistribution):
+            return self.action_dist.proba_distribution(mean_actions, self.log_std)
+        elif isinstance(self.action_dist, CategoricalDistribution):
+            # Here mean_actions are the logits before the softmax
+            return self.action_dist.proba_distribution(action_logits=mean_actions)
+        elif isinstance(self.action_dist, MultiCategoricalDistribution):
+            # Here mean_actions are the flattened logits
+            return self.action_dist.proba_distribution(action_logits=mean_actions)
+        elif isinstance(self.action_dist, BernoulliDistribution):
+            # Here mean_actions are the logits (before rounding to get the binary actions)
+            return self.action_dist.proba_distribution(action_logits=mean_actions)
+        elif isinstance(self.action_dist, StateDependentNoiseDistribution):
+            return self.action_dist.proba_distribution(mean_actions, self.log_std, latent_pi)
+        else:
+            raise ValueError("Invalid action distribution")
 
     def update_target(self):
         self.target_value_net.load_state_dict(self.value_net.state_dict())
         self.target_value_net.requires_grad_(False)
+
+        self.target_action_net.load_state_dict(self.action_net.state_dict())
+        self.target_action_net.requires_grad_(False)
 
     def forward(self, obs: th.Tensor, deterministic: bool = False) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
@@ -857,8 +888,7 @@ class ActorCriticCnnTreeQNPolicy(ActorCriticPolicy):
         :return: action, value and log probability of the action
         """
         # Preprocess the observation if needed
-        features = self.extract_features(obs)
-        latent_pi, latent_vf = self.mlp_extractor(features)
+        latent_pi = self.value_net.embed_obs(obs)
         # Evaluate the values for the given observations
         Q, V, tree_result = self.value_net(obs)
         distribution = self._get_action_dist_from_latent(latent_pi)
@@ -877,8 +907,7 @@ class ActorCriticCnnTreeQNPolicy(ActorCriticPolicy):
             and entropy of the action distribution.
         """
         # Preprocess the observation if needed
-        features = self.extract_features(obs)
-        latent_pi, latent_vf = self.mlp_extractor(features)
+        latent_pi = self.value_net.embed_obs(obs)
         distribution = self._get_action_dist_from_latent(latent_pi)
         log_prob = distribution.log_prob(actions)
         Q, _, tree_results = self.value_net(obs)

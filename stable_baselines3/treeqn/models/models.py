@@ -118,12 +118,10 @@ class TreeQNPolicy(nn.Module):
 
         st = self.embed_obs(ob, volatile=volatile)
 
-        if self.normalise_state:
-            st = st / st.pow(2).sum(-1, keepdim=True).sqrt()
-
         Q, tree_result = self.planning(st)
-
-        if self.use_actor_critic:
+        if self.value_aggregation == "actor":
+            V = torch.sum(Q * self.get_probs(st), dim=-1)
+        elif self.use_actor_critic:
             V = self.ac_value_fn(st).squeeze()
         else:
             V = torch.max(Q, 1)[0]
@@ -141,6 +139,10 @@ class TreeQNPolicy(nn.Module):
 
         # -- [batch_size x embedding_dim]
         st = self.embed(ob)
+
+        if self.normalise_state:
+            st = st / st.pow(2).sum(-1, keepdim=True).sqrt()
+
         return st
 
     # def step(self, ob):
@@ -266,6 +268,10 @@ class TreeQNPolicy(nn.Module):
                     max_backup = logsumexp(one_step_backup, 2)
                 elif self.value_aggregation == "softmax":
                     max_backup = (one_step_backup * F.softmax(one_step_backup, dim=2)).sum(dim=2)
+                elif self.value_aggregation == "actor":
+                    embeddings = tree_result["embeddings"][-i - 1]
+                    probs = self.get_probs(embeddings).view(batch_size, -1, self.num_actions)
+                    max_backup = torch.sum(one_step_backup * probs, dim=2)
                 else:
                     raise ValueError("Unknown value aggregation function %s" % self.value_aggregation)
 
