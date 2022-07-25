@@ -827,7 +827,7 @@ class ActorCriticCnnTreeQNPolicy(ActorCriticPolicy):
             "input_mode": 'atari',
             "gamma": 0.99,
             "predict_rewards": True,
-            "value_aggregation": 'softmax',
+            "value_aggregation": 'actor',
             "td_lambda": 0.95,
             "normalise_state": True,
         }
@@ -841,6 +841,10 @@ class ActorCriticCnnTreeQNPolicy(ActorCriticPolicy):
 
         self.value_net = policy(observation_space, action_space)
         self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
+        self.value_net.get_probs = self.get_probs
+
+    def get_probs(self, latent_pi: th.Tensor):
+        return self._get_action_dist_from_latent(latent_pi).distribution.probs
 
     def forward(self, obs: th.Tensor, deterministic: bool = False) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
@@ -851,8 +855,7 @@ class ActorCriticCnnTreeQNPolicy(ActorCriticPolicy):
         :return: action, value and log probability of the action
         """
         # Preprocess the observation if needed
-        features = self.extract_features(obs)
-        latent_pi, latent_vf = self.mlp_extractor(features)
+        latent_pi = self.value_net.embed_obs(obs)
         # Evaluate the values for the given observations
         values = self.value_net.value(obs)
         distribution = self._get_action_dist_from_latent(latent_pi)
@@ -871,8 +874,7 @@ class ActorCriticCnnTreeQNPolicy(ActorCriticPolicy):
             and entropy of the action distribution.
         """
         # Preprocess the observation if needed
-        features = self.extract_features(obs)
-        latent_pi, latent_vf = self.mlp_extractor(features)
+        latent_pi = self.value_net.embed_obs(obs)
         distribution = self._get_action_dist_from_latent(latent_pi)
         log_prob = distribution.log_prob(actions)
         Q, values, tree_results = self.value_net(obs)
