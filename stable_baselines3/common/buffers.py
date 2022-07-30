@@ -448,9 +448,8 @@ class RolloutBuffer(BaseBuffer):
         # TD(lambda) estimator, see Github PR #375 or "Telescoping in TD(lambda)"
         # in David Silver Lecture 4: https://www.youtube.com/watch?v=PnHCvfgC_ZA
         self.returns = self.advantages + self.values
-        self.action_sequences, self.reward_sequences, self.sequence_mask = self._build_seq([self.actions, self.rewards], offset=0)
-        self.st_targets, self.st_mask = self._build_seq([self.states], offset=1)
-        #self._build_sequences()
+        self.action_sequences, self.reward_sequences, self.sequence_mask = self._build_sequences([self.actions, self.rewards], offset=0)
+        self.st_targets, self.st_mask = self._build_sequences([self.states], offset=1)
 
     def add(
         self,
