@@ -349,6 +349,10 @@ class RolloutBuffer(BaseBuffer):
         self.reward_sequences = None
         self.sequence_mask = None
         self.q_values = None
+        self.states = None
+        self.st_targets = None
+        self.st_mask = None
+        self.state_dim = 512
         self.generator_ready = False
         self.tree_depth = tree_depth
         self.reset()
@@ -367,6 +371,9 @@ class RolloutBuffer(BaseBuffer):
         self.action_sequences = None
         self.reward_sequences = None
         self.sequence_mask = None
+        self.states = np.zeros((self.buffer_size, self.n_envs, self.state_dim), dtype=np.float32)
+        self.st_targets = None
+        self.st_mask = None
         self.generator_ready = False
         super(RolloutBuffer, self).reset()
 
@@ -377,24 +384,23 @@ class RolloutBuffer(BaseBuffer):
             mask[max_i:] = 1
         return (1 - mask)[:, np.newaxis]
 
-    def _build_sequences(self):
+    def _build_sequences(self, sequences, offset=0):
         n_steps = self.actions.shape[0]
         assert self.actions.shape[1] == self.n_envs
 
-        actions = np.swapaxes(self.actions, 0, 1).flatten()
-        rewards = np.swapaxes(self.rewards, 0, 1).flatten()
+        for i in range(len(sequences)):
+            sequences[i] = np.swapaxes(sequences[i], 0, 1).squeeze()
+
         masks = np.swapaxes(self.episode_starts.astype(np.int32), 0, 1).flatten()
 
-        sequences = [actions, rewards]
-
         tmp_masks = masks.reshape((self.n_envs, n_steps)).astype(np.int32)
-        tmp_masks = np.pad(tmp_masks, pad_width=((0, 0), (0, self.tree_depth)), constant_values=1)
+        tmp_masks = np.pad(tmp_masks, pad_width=((0, 0), (0, self.tree_depth + offset)), constant_values=1)
 
         sequences = [s.reshape((self.n_envs, n_steps, -1)) for s in sequences]
         mask = np.ones_like(sequences[0], dtype=np.float32)
         sequences.append(mask)
 
-        sequences = [np.pad(s, pad_width=((0, 0), (0, self.tree_depth), (0, 0)), constant_values=0) for s in sequences]
+        sequences = [np.pad(s, pad_width=((0, 0), (0, self.tree_depth + offset), (0, 0)), constant_values=0) for s in sequences]
         proc_sequences = []
         for seq in sequences:
             proc_seq = []
@@ -402,11 +408,9 @@ class RolloutBuffer(BaseBuffer):
                 for t in range(n_steps):
                     seq_done_mask = self._make_seq_mask(tmp_masks[env, t:t + self.tree_depth].copy())
                     proc_seq.append(seq[env, t:t + self.tree_depth, :].astype(np.float32) * seq_done_mask.astype(np.float32))
-            proc_sequences.append(np.stack(proc_seq).reshape((n_steps, self.n_envs, self.tree_depth, 1)))
+            proc_sequences.append(np.stack(proc_seq).reshape((n_steps, self.n_envs, self.tree_depth, -1)))
 
-        self.action_sequences = proc_sequences[0]
-        self.reward_sequences = proc_sequences[1]
-        self.sequence_mask = proc_sequences[2]
+        return proc_sequences
 
     def compute_returns_and_advantage(self, last_values: th.Tensor, dones: np.ndarray) -> None:
         """
@@ -444,7 +448,9 @@ class RolloutBuffer(BaseBuffer):
         # TD(lambda) estimator, see Github PR #375 or "Telescoping in TD(lambda)"
         # in David Silver Lecture 4: https://www.youtube.com/watch?v=PnHCvfgC_ZA
         self.returns = self.advantages + self.values
-        self._build_sequences()
+        self.action_sequences, self.reward_sequences, self.sequence_mask = self._build_seq([self.actions, self.rewards], offset=0)
+        self.st_targets, self.st_mask = self._build_seq([self.states], offset=1)
+        #self._build_sequences()
 
     def add(
         self,
@@ -454,7 +460,8 @@ class RolloutBuffer(BaseBuffer):
         episode_start: np.ndarray,
         value: th.Tensor,
         log_prob: th.Tensor,
-        q_values: th.Tensor
+        q_values: th.Tensor,
+        states: th.Tensor
     ) -> None:
         """
         :param obs: Observation
@@ -482,6 +489,7 @@ class RolloutBuffer(BaseBuffer):
         self.values[self.pos] = value.clone().cpu().numpy().flatten()
         self.log_probs[self.pos] = log_prob.clone().cpu().numpy()
         self.q_values[self.pos] = q_values.clone().cpu().numpy()
+        self.states[self.pos] = states.clone().cpu().numpy()
         self.pos += 1
         if self.pos == self.buffer_size:
             self.full = True
@@ -504,6 +512,8 @@ class RolloutBuffer(BaseBuffer):
                 "reward_sequences",
                 "sequence_mask",
                 "q_values",
+                "st_targets",
+                "st_mask"
             ]
 
             for tensor in _tensor_names:
@@ -532,6 +542,8 @@ class RolloutBuffer(BaseBuffer):
             self.reward_sequences[batch_inds],
             self.sequence_mask[batch_inds],
             self.q_values[batch_inds],
+            self.st_targets[batch_inds],
+            self.st_mask[batch_inds]
         )
         return RolloutBufferSamples(*tuple(map(self.to_torch, data)))
 

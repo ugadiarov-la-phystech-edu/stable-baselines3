@@ -33,6 +33,8 @@ class RolloutBufferSamples(NamedTuple):
     reward_sequences: th.Tensor
     sequence_mask: th.Tensor
     q_values: th.Tensor
+    st_targets: th.Tensor
+    st_mask: th.Tensor
 
 
 class DictRolloutBufferSamples(RolloutBufferSamples):

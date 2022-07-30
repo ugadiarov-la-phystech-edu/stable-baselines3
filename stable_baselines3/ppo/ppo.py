@@ -94,7 +94,9 @@ class PPO(OnPolicyAlgorithm):
         _init_setup_model: bool = True,
         use_reward_loss: bool = True,
         reward_loss_coef: float = 0.5,
-        target_update_interval: int = 1000
+        target_update_interval: int = 1000,
+        use_state_loss: bool = True,
+        state_loss_coef: float = 0.5
     ):
 
         super(PPO, self).__init__(
@@ -124,6 +126,8 @@ class PPO(OnPolicyAlgorithm):
             ),
         )
 
+        self.use_state_loss = use_state_loss
+        self.state_loss_coef = state_loss_coef
         self.use_reward_loss = use_reward_loss
         self.reward_loss_coef = reward_loss_coef
         self.target_update_interval = target_update_interval
@@ -192,6 +196,7 @@ class PPO(OnPolicyAlgorithm):
         entropy_losses = []
         pg_losses, value_losses = [], []
         reward_losses = []
+        state_losses = []
         actions_taken = np.zeros(self.action_space.n, dtype=np.float32)
         actions_probs = np.zeros(self.action_space.n, dtype=np.float32)
         q_values = []
@@ -271,6 +276,21 @@ class PPO(OnPolicyAlgorithm):
                     reward_losses.append(reward_loss.item())
                     loss = loss + self.reward_loss_coef * reward_loss
 
+                st_targets = rollout_data.st_targets.reshape((rollout_data.st_targets.shape[0], -1))
+                st_mask = rollout_data.st_mask.reshape((rollout_data.st_mask.shape[0], -1))
+
+                st_taken = get_paths(tree_result["embeddings"][1:], rollout_data.action_sequences.long().squeeze(-1), rollout_data.action_sequences.shape[0],
+                                     self.action_space.n)
+
+                st_taken_cat = th.cat(st_taken, 1)
+
+                st_loss = F.mse_loss(st_taken_cat, st_targets, reduce=False)
+                st_loss = th.sum(st_loss * st_mask) / st_mask.sum()
+
+                state_losses.append(st_loss.data.cpu().numpy())
+                if self.use_state_loss:
+                    loss = loss + st_loss * self.state_loss_coef
+
                 # Calculate approximate form of reverse KL Divergence for early stopping
                 # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
                 # and discussion in PR #419: https://github.com/DLR-RM/stable-baselines3/pull/419
@@ -317,6 +337,7 @@ class PPO(OnPolicyAlgorithm):
         self.logger.record("train/value_loss", np.mean(value_losses))
         if self.use_reward_loss:
             self.logger.record("train/reward_loss", np.mean(reward_losses))
+        self.logger.record("train/state_loss", np.mean(state_losses))
         self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
         self.logger.record("train/loss", loss.item())
         self.logger.record("train/explained_variance", explained_var)
