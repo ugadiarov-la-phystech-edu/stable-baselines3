@@ -1,3 +1,4 @@
+import copy
 import datetime
 import collections
 import json
@@ -81,10 +82,7 @@ class StatsRecorder:
         if self._n_episodes == 0:
             return {}
 
-        crafter_statistics = {
-            f'success_rate_{key}': value / self._n_episodes for key, value in self._cumulative_achievements.items()
-        }
-        crafter_statistics['score'] = np.exp(np.log(np.asarray(list(crafter_statistics.values())) * 100 + 1).mean()) - 1
+        crafter_statistics = {'cumulative_achievements': copy.deepcopy(self._cumulative_achievements)}
         crafter_statistics['reward_mean'] = mean(self._rewards)
         crafter_statistics['length_mean'] = mean(self._lengths)
         crafter_statistics['n_episodes'] = self._n_episodes

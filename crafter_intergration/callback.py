@@ -46,11 +46,13 @@ model.learn(
 )
 ```
 """
-
+import collections
 import logging
 import os
 import sys
 from typing import Optional
+
+import numpy as np
 
 from crafter_intergration.recorder import Recorder
 
@@ -58,6 +60,8 @@ if sys.version_info >= (3, 8):
     from typing import Literal
 else:
     from typing_extensions import Literal
+
+from typing import List
 
 from stable_baselines3.common.callbacks import BaseCallback  # type: ignore
 from stable_baselines3.common.logger import Logger
@@ -86,7 +90,6 @@ class WandbCallback(BaseCallback):
     def __init__(
         self,
         sb3_logger: Logger,
-        recorder: Recorder,
         verbose: int = 0,
         model_save_path: Optional[str] = None,
         model_save_freq: int = 0,
@@ -101,7 +104,7 @@ class WandbCallback(BaseCallback):
         self.model_save_freq = model_save_freq
         self.model_save_path = model_save_path
         self.gradient_save_freq = gradient_save_freq
-        self.recorder = recorder
+        self.recorders = None
         self.sb3_logger = sb3_logger
         if log not in ["gradients", "parameters", "all", None]:
             wandb.termwarn(
@@ -118,6 +121,9 @@ class WandbCallback(BaseCallback):
             assert (
                 self.model_save_freq == 0
             ), "to use the `model_save_freq` you have to set the `model_save_path` parameter"
+
+    def set_recorders(self, recorders):
+        self.recorders = recorders
 
     def _init_callback(self) -> None:
         d = {}
@@ -156,6 +162,23 @@ class WandbCallback(BaseCallback):
             logger.info(f"Saving model checkpoint to {self.path}")
 
     def _on_rollout_end(self) -> None:
-        for key, value in self.recorder.crafter_statistics().items():
-            self.logger.record(key, value)
+        statistics = collections.Counter()
+        cumulative_achievements = collections.Counter()
+        for env_statistics in self.recorders.env_method('crafter_statistics'):
+            if 'cumulative_achievements' in env_statistics:
+                for key, value in env_statistics['cumulative_achievements'].items():
+                    cumulative_achievements[key] += value
+            for key in 'reward_mean', 'length_mean', 'n_episodes', 'step':
+                if key in env_statistics:
+                    statistics[key] += env_statistics[key]
+
+        crafter_statistics = {
+            f'success_rate_{key}': value / statistics['n_episodes'] for key, value in cumulative_achievements.items()
+        }
+        crafter_statistics['score'] = np.exp(np.log(np.asarray(list(crafter_statistics.values())) * 100 + 1).mean()) - 1
+
+        for key in crafter_statistics:
+            self.logger.record(key, crafter_statistics[key])
+        for key in statistics:
+            self.logger.record(key, statistics[key] / (self.recorders.num_envs if 'mean' in key else 1))
 

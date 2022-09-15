@@ -239,6 +239,9 @@ class OnPolicyAlgorithm(BaseAlgorithm):
     ) -> "OnPolicyAlgorithm":
         iteration = 0
 
+        if hasattr(callback, 'set_recorders'):
+            callback.set_recorders(self.env)
+
         total_timesteps, callback = self._setup_learn(
             total_timesteps, eval_env, callback, eval_freq, n_eval_episodes, eval_log_path, reset_num_timesteps, tb_log_name
         )
