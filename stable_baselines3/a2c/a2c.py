@@ -170,8 +170,9 @@ class A2C(OnPolicyAlgorithm):
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         self.logger.record("train/explained_variance", explained_var)
         self.logger.record("train/entropy_loss", entropy_loss.item())
-        self.logger.record("train/policy_loss", policy_loss.item())
+        self.logger.record("train/policy_gradient_loss", policy_loss.item())
         self.logger.record("train/value_loss", value_loss.item())
+        self.logger.record("train/loss", loss.item())
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
 
