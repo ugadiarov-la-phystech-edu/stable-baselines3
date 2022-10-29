@@ -7,7 +7,7 @@ from torch.nn import functional as F
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
-from stable_baselines3.common.utils import explained_variance
+from stable_baselines3.common.utils import explained_variance, RandomQueue
 
 
 class A2C(OnPolicyAlgorithm):
@@ -74,6 +74,11 @@ class A2C(OnPolicyAlgorithm):
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
+        state_criterion_class: Type[th.nn.Module] = None,
+        state_criterion_kwargs: Optional[Dict[str, Any]] = {},
+        state_coef: float = 0.0,
+        state_buffer_class=RandomQueue,
+        state_buffer_kwargs: Optional[Dict[str, Any]] = {}
     ):
 
         super(A2C, self).__init__(
@@ -104,6 +109,14 @@ class A2C(OnPolicyAlgorithm):
         )
 
         self.normalize_advantage = normalize_advantage
+        self.state_criterion = None
+        if state_criterion_class is not None:
+            self.state_criterion = state_criterion_class(**state_criterion_kwargs)
+        self.predict_transition = self.state_criterion is not None
+        self.state_coef = state_coef
+        self.state_buffer_class = state_buffer_class
+        self.state_buffer_kwargs = state_buffer_kwargs
+        self.state_buffer = None
 
         # Update optimizer inside the policy if we want to use RMSProp
         # (original implementation) rather than Adam
@@ -113,6 +126,10 @@ class A2C(OnPolicyAlgorithm):
 
         if _init_setup_model:
             self._setup_model()
+
+    @staticmethod
+    def _flatten_over_objects(state_embedding):
+        return state_embedding.view(-1, state_embedding.size()[-1])
 
     def train(self) -> None:
         """
@@ -125,6 +142,16 @@ class A2C(OnPolicyAlgorithm):
         # Update optimizer learning rate
         self._update_learning_rate(self.policy.optimizer)
 
+        if self.predict_transition:
+            observations = self.rollout_buffer.observations
+            observations = observations.reshape(observations.shape[0] * observations.shape[1], *observations.shape[2:])
+            if self.state_buffer is None:
+                kwargs = dict(self.state_buffer_kwargs)
+                kwargs['element_shape'] = observations.shape[1:]
+                self.state_buffer = self.state_buffer_class(**kwargs)
+
+            self.state_buffer.insert(observations)
+
         # This will only loop once (get all data in one go)
         for rollout_data in self.rollout_buffer.get(batch_size=None):
 
@@ -133,7 +160,8 @@ class A2C(OnPolicyAlgorithm):
                 # Convert discrete action from float to long
                 actions = actions.long().flatten()
 
-            values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
+            values, log_prob, entropy, state_embedding, transition = self.policy.evaluate_actions(
+                rollout_data.observations, actions, predict_transition=self.predict_transition)
             values = values.flatten()
 
             # Normalize advantage (not present in the original implementation)
@@ -156,6 +184,28 @@ class A2C(OnPolicyAlgorithm):
 
             loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
 
+            if self.predict_transition:
+                assert state_embedding is not None
+                assert transition is not None
+                next_state_embedding_true = state_embedding[1:]
+                state_embedding = state_embedding[:-1]
+                transition = transition[:-1]
+                episode_not_done = 1 - rollout_data.episode_starts[1:].unsqueeze(1).expand(-1, state_embedding.size()[1]).flatten()
+
+                negative_observations = th.from_numpy(self.state_buffer.sample(state_embedding.size()[0])).to(self.device)
+                negative_state_embedding = self._flatten_over_objects(self.policy.extract_features(negative_observations)
+                                                                      .view(*state_embedding.size()))
+                state_embedding = self._flatten_over_objects(state_embedding)
+                next_state_embedding_true = self._flatten_over_objects(next_state_embedding_true)
+                transition = self._flatten_over_objects(transition)
+
+                state_loss = self.state_criterion(
+                    state_embedding, next_state_embedding_true, state_embedding + transition,
+                    negative_state_embedding
+                )
+                state_loss = th.mean(episode_not_done * state_loss)
+                loss += self.state_coef * state_loss
+
             # Optimization step
             self.policy.optimizer.zero_grad()
             loss.backward()
@@ -173,6 +223,9 @@ class A2C(OnPolicyAlgorithm):
         self.logger.record("train/policy_gradient_loss", policy_loss.item())
         self.logger.record("train/value_loss", value_loss.item())
         self.logger.record("train/loss", loss.item())
+        if self.predict_transition:
+            self.logger.record("train/state_loss", state_loss.item())
+
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
 
