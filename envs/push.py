@@ -78,6 +78,8 @@ class Push(gym.Env):
 
     def seed(self, seed=None):
         self.np_random, seed = seeding.np_random(seed)
+        self.action_space.seed(seed + 1)
+        self.observation_space.seed(seed + 2)
         return [seed]
 
     def _get_observation(self):

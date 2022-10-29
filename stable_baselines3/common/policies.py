@@ -12,6 +12,7 @@ import numpy as np
 import torch as th
 from torch import nn
 
+from stable_baselines3.common import utils
 from stable_baselines3.common.distributions import (
     BernoulliDistribution,
     CategoricalDistribution,
@@ -28,7 +29,7 @@ from stable_baselines3.common.torch_layers import (
     FlattenExtractor,
     MlpExtractor,
     NatureCNN,
-    create_mlp,
+    create_mlp, CSWMCNN,
 )
 from stable_baselines3.common.type_aliases import Schedule
 from stable_baselines3.common.utils import get_device, is_vectorized_observation, obs_as_tensor
@@ -743,6 +744,417 @@ class ActorCriticCnnPolicy(ActorCriticPolicy):
             optimizer_class,
             optimizer_kwargs,
         )
+
+
+class ActorCriticCSWMPolicy(BasePolicy):
+    """
+    Policy class for actor-critic algorithms (has both policy and value prediction).
+    Used by A2C, PPO and the likes.
+
+    :param observation_space: Observation space
+    :param action_space: Action space
+    :param lr_schedule: Learning rate schedule (could be constant)
+    :param use_sde: Whether to use State Dependent Exploration or not
+    :param log_std_init: Initial value for the log standard deviation
+    :param full_std: Whether to use (n_features x n_actions) parameters
+        for the std instead of only (n_features,) when using gSDE
+    :param sde_net_arch: Network architecture for extracting features
+        when using gSDE. If None, the latent features from the policy will be used.
+        Pass an empty list to use the states as features.
+    :param use_expln: Use ``expln()`` function instead of ``exp()`` to ensure
+        a positive standard deviation (cf paper). It allows to keep variance
+        above zero and prevent it from growing too fast. In practice, ``exp()`` is usually enough.
+    :param squash_output: Whether to squash the output using a tanh function,
+        this allows to ensure boundaries when using gSDE.
+    :param features_extractor_class: Features extractor to use.
+    :param features_extractor_kwargs: Keyword arguments
+        to pass to the features extractor.
+    :param normalize_images: Whether to normalize images or not,
+         dividing by 255.0 (True by default)
+    :param optimizer_class: The optimizer to use,
+        ``th.optim.Adam`` by default
+    :param optimizer_kwargs: Additional keyword arguments,
+        excluding the learning rate, to pass to the optimizer
+    """
+
+    def __init__(
+        self,
+        observation_space: gym.spaces.Space,
+        action_space: gym.spaces.Space,
+        lr_schedule: Schedule,
+        action_net_head_type: str = 'mean',
+        value_net_head_type: str = 'sum',
+        use_sde: bool = False,
+        log_std_init: float = 0.0,
+        full_std: bool = True,
+        sde_net_arch: Optional[List[int]] = None,
+        use_expln: bool = False,
+        squash_output: bool = False,
+        embedding_dim: int = 128,
+        hidden_dim: int = 512,
+        num_objects: int = 6,
+        features_extractor_class: Type[CSWMCNN] = CSWMCNN,
+        features_extractor_kwargs: Optional[Dict[str, Any]] = None,
+        normalize_images: bool = True,
+        optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
+        optimizer_kwargs: Optional[Dict[str, Any]] = None
+    ):
+
+        if optimizer_kwargs is None:
+            optimizer_kwargs = {}
+            # Small values to avoid NaN in Adam optimizer
+            if optimizer_class == th.optim.Adam:
+                optimizer_kwargs["eps"] = 1e-5
+
+        super(ActorCriticCSWMPolicy, self).__init__(
+            observation_space,
+            action_space,
+            features_extractor_class,
+            features_extractor_kwargs,
+            optimizer_class=optimizer_class,
+            optimizer_kwargs=optimizer_kwargs,
+            squash_output=squash_output,
+        )
+
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
+        self.num_objects = num_objects
+        self.action_net_head_type = action_net_head_type
+        self.value_net_head_type = value_net_head_type
+
+        self.features_extractor = features_extractor_class(
+            self.observation_space, self.embedding_dim, self.hidden_dim, self.num_objects,
+            **self.features_extractor_kwargs
+        )
+        self.features_dim = self.features_extractor.features_dim
+
+        self.normalize_images = normalize_images
+        self.log_std_init = log_std_init
+        dist_kwargs = None
+        # Keyword arguments for gSDE distribution
+        if use_sde:
+            dist_kwargs = {
+                "full_std": full_std,
+                "squash_output": squash_output,
+                "use_expln": use_expln,
+                "learn_features": False,
+            }
+
+        if sde_net_arch is not None:
+            warnings.warn("sde_net_arch is deprecated and will be removed in SB3 v2.4.0.", DeprecationWarning)
+
+        self.use_sde = use_sde
+        self.dist_kwargs = dist_kwargs
+
+        # Action distribution
+        self.action_dist = make_proba_distribution(action_space, use_sde=use_sde, dist_kwargs=dist_kwargs)
+
+        self._build(lr_schedule)
+
+    def _get_constructor_parameters(self) -> Dict[str, Any]:
+        data = super()._get_constructor_parameters()
+
+        default_none_kwargs = self.dist_kwargs or collections.defaultdict(lambda: None)
+        data.update(
+            dict(
+                embedding_dim=self.embedding_dim,
+                hidden_dim=self.hidden_dim,
+                num_objects=self.num_objects,
+                action_net_head=self.action_net_head_type,
+                value_net_head=self.value_net_head_type,
+                use_sde=self.use_sde,
+                log_std_init=self.log_std_init,
+                squash_output=default_none_kwargs["squash_output"],
+                full_std=default_none_kwargs["full_std"],
+                use_expln=default_none_kwargs["use_expln"],
+                lr_schedule=self._dummy_schedule,  # dummy lr schedule, not needed for loading policy alone
+                optimizer_class=self.optimizer_class,
+                optimizer_kwargs=self.optimizer_kwargs,
+                features_extractor_class=self.features_extractor_class,
+                features_extractor_kwargs=self.features_extractor_kwargs,
+            )
+        )
+        return data
+
+    def reset_noise(self, n_envs: int = 1) -> None:
+        """
+        Sample new weights for the exploration matrix.
+
+        :param n_envs:
+        """
+        assert isinstance(self.action_dist, StateDependentNoiseDistribution), "reset_noise() is only available when using gSDE"
+        self.action_dist.sample_weights(self.log_std, batch_size=n_envs)
+
+    def _build(self, lr_schedule: Schedule) -> None:
+        """
+        Create the networks and the optimizer.
+
+        :param lr_schedule: Learning rate schedule
+            lr_schedule(1) is the initial learning rate
+        """
+        self.transition_net = TransitionGNN(
+            input_dim=self.embedding_dim, output_dim=self.embedding_dim, hidden_dim=self.hidden_dim,
+            action_dim=self.action_space.n, num_objects=self.num_objects, ignore_action=False, copy_action=True
+        )
+        self.value_net = TransitionGNN(
+            input_dim=self.embedding_dim, output_dim=1, hidden_dim=self.hidden_dim,
+            action_dim=self.action_space.n, num_objects=self.num_objects, ignore_action=True, copy_action=True,
+            head_module_type=self.value_net_head_type
+        )
+        action_net = TransitionGNN(
+            input_dim=self.embedding_dim, output_dim=self.embedding_dim, hidden_dim=self.hidden_dim,
+            action_dim=self.action_space.n, num_objects=self.num_objects, ignore_action=True, copy_action=True,
+            head_module_type=self.action_net_head_type
+        )
+
+        assert isinstance(
+            self.action_dist,
+            (CategoricalDistribution, MultiCategoricalDistribution, BernoulliDistribution)
+        ), f'Invalid action distribution type: {type(self.action_dist)}'
+
+        self.action_net = nn.Sequential(
+            action_net,
+            self.action_dist.proba_distribution_net(latent_dim=self.embedding_dim)
+        )
+
+        # Setup optimizer with initial learning rate
+        self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
+
+    def forward(self, obs: th.Tensor, deterministic: bool = False) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """
+        Forward pass in all the networks (actor and critic)
+
+        :param obs: Observation
+        :param deterministic: Whether to sample or use deterministic actions
+        :return: action, value and log probability of the action
+        """
+        # Preprocess the observation if needed
+        features = self.extract_features(obs)
+        # Evaluate the values for the given observations
+        values = self.value_net(features)
+        distribution = self._get_action_dist_from_latent(features)
+        actions = distribution.get_actions(deterministic=deterministic)
+        log_prob = distribution.log_prob(actions)
+        return actions, values, log_prob
+
+    def _get_action_dist_from_latent(self, latent_pi: th.Tensor) -> Distribution:
+        """
+        Retrieve action distribution given the latent codes.
+
+        :param latent_pi: Latent code for the actor
+        :return: Action distribution
+        """
+        mean_actions = self.action_net(latent_pi)
+
+        if isinstance(self.action_dist, DiagGaussianDistribution):
+            return self.action_dist.proba_distribution(mean_actions, self.log_std)
+        elif isinstance(self.action_dist, CategoricalDistribution):
+            # Here mean_actions are the logits before the softmax
+            return self.action_dist.proba_distribution(action_logits=mean_actions)
+        elif isinstance(self.action_dist, MultiCategoricalDistribution):
+            # Here mean_actions are the flattened logits
+            return self.action_dist.proba_distribution(action_logits=mean_actions)
+        elif isinstance(self.action_dist, BernoulliDistribution):
+            # Here mean_actions are the logits (before rounding to get the binary actions)
+            return self.action_dist.proba_distribution(action_logits=mean_actions)
+        elif isinstance(self.action_dist, StateDependentNoiseDistribution):
+            return self.action_dist.proba_distribution(mean_actions, self.log_std, latent_pi)
+        else:
+            raise ValueError("Invalid action distribution")
+
+    def _predict(self, observation: th.Tensor, deterministic: bool = False) -> th.Tensor:
+        """
+        Get the action according to the policy for a given observation.
+
+        :param observation:
+        :param deterministic: Whether to use stochastic or deterministic actions
+        :return: Taken action according to the policy
+        """
+        return self.get_distribution(observation).get_actions(deterministic=deterministic)
+
+    def evaluate_actions(self, obs: th.Tensor, actions: th.Tensor, predict_transition=False) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
+        """
+        Evaluate actions according to the current policy,
+        given the observations.
+
+        :param obs:
+        :param actions:
+        :return: estimated value, log likelihood of taking those actions
+            and entropy of the action distribution.
+        """
+        # Preprocess the observation if needed
+        features = self.extract_features(obs)
+        distribution = self._get_action_dist_from_latent(features)
+        log_prob = distribution.log_prob(actions)
+        values = self.value_net(features)
+        if predict_transition:
+            return values, log_prob, distribution.entropy(),\
+                   features.view(features.size()[0], self.num_objects, -1), self.transition_net(features, actions)
+
+        return values, log_prob, distribution.entropy(), None, None
+
+    def get_distribution(self, obs: th.Tensor) -> Distribution:
+        """
+        Get the current policy distribution given the observations.
+
+        :param obs:
+        :return: the action distribution.
+        """
+        features = self.extract_features(obs)
+        return self._get_action_dist_from_latent(features)
+
+    def predict_values(self, obs: th.Tensor) -> th.Tensor:
+        """
+        Get the estimated values according to the current policy given the observations.
+
+        :param obs:
+        :return: the estimated values.
+        """
+        features = self.extract_features(obs)
+        return self.value_net(features)
+
+
+class TransitionGNN(th.nn.Module):
+    """GNN-based transition function."""
+    def __init__(self, input_dim, output_dim, hidden_dim, action_dim, num_objects,
+                 ignore_action=False, copy_action=False, act_fn='relu', head_module_type: str = None):
+        super(TransitionGNN, self).__init__()
+
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.hidden_dim = hidden_dim
+        self.num_objects = num_objects
+        self.ignore_action = ignore_action
+        self.copy_action = copy_action
+
+        if self.ignore_action:
+            self.action_dim = 0
+        else:
+            self.action_dim = action_dim
+
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(input_dim*2, hidden_dim),
+            utils.get_act_fn(act_fn),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            utils.get_act_fn(act_fn),
+            nn.Linear(hidden_dim, hidden_dim))
+
+        node_input_dim = input_dim
+        if not self.ignore_action:
+            node_input_dim += self.action_dim
+        if self.num_objects > 1:
+            node_input_dim += hidden_dim
+
+        self.node_mlp = nn.Sequential(
+            nn.Linear(node_input_dim, hidden_dim),
+            utils.get_act_fn(act_fn),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            utils.get_act_fn(act_fn),
+            nn.Linear(hidden_dim, output_dim))
+
+        if head_module_type is None:
+            self.head_module = lambda x: x
+        elif head_module_type == 'sum':
+            self.head_module = lambda x: th.sum(x, dim=1, keepdim=False)
+        elif head_module_type == 'mean':
+            self.head_module = lambda x: th.mean(x, dim=1, keepdim=False)
+        else:
+            raise ValueError(f'Invalid head module type: {head_module_type}.')
+
+        self.edge_list = None
+        self.batch_size = 0
+
+    def _edge_model(self, source, target, edge_attr):
+        del edge_attr  # Unused.
+        out = th.cat([source, target], dim=1)
+        return self.edge_mlp(out)
+
+    def _node_model(self, node_attr, edge_index, edge_attr):
+        if edge_attr is not None:
+            row, col = edge_index
+            agg = utils.unsorted_segment_sum(
+                edge_attr, row, num_segments=node_attr.size(0))
+            out = th.cat([node_attr, agg], dim=1)
+        else:
+            out = node_attr
+        return self.node_mlp(out)
+
+    def _get_edge_list_fully_connected(self, batch_size, num_objects, cuda):
+        # Only re-evaluate if necessary (e.g. if batch size changed).
+        if self.edge_list is None or self.batch_size != batch_size:
+            self.batch_size = batch_size
+
+            # Create fully-connected adjacency matrix for single sample.
+            adj_full = th.ones(num_objects, num_objects)
+
+            # Remove diagonal.
+            adj_full -= th.eye(num_objects)
+            self.edge_list = adj_full.nonzero()
+
+            # Copy `batch_size` times and add offset.
+            self.edge_list = self.edge_list.repeat(batch_size, 1)
+            offset = th.arange(
+                0, batch_size * num_objects, num_objects).unsqueeze(-1)
+            offset = offset.expand(batch_size, num_objects * (num_objects - 1))
+            offset = offset.contiguous().view(-1)
+            self.edge_list += offset.unsqueeze(-1)
+
+            # Transpose to COO format -> Shape: [2, num_edges].
+            self.edge_list = self.edge_list.transpose(0, 1)
+
+            if cuda:
+                self.edge_list = self.edge_list.cuda()
+
+        return self.edge_list
+
+    def forward(self, states, action=None):
+        if self.ignore_action:
+            assert action is None, f"Cannot pass action parameter when actions are ignored: ignore_action: {self.ignore_action}, action.shape: {action.shape}."
+        else:
+            assert action is not None, f"Passing action is required when actions are not ignored: ignore_action: {self.ignore_action}, action: {action}."
+
+        cuda = states.is_cuda
+        batch_size = states.size(0)
+        states = states.view(batch_size, self.num_objects, -1)
+
+        # states: [batch_size (B), num_objects, embedding_dim]
+        # node_attr: Flatten states tensor to [B * num_objects, embedding_dim]
+        node_attr = states.view(-1, self.input_dim)
+
+        edge_attr = None
+        edge_index = None
+
+        if self.num_objects > 1:
+            # edge_index: [B * (num_objects*[num_objects-1]), 2] edge list
+            edge_index = self._get_edge_list_fully_connected(
+                batch_size, self.num_objects, cuda)
+
+            row, col = edge_index
+            edge_attr = self._edge_model(
+                node_attr[row], node_attr[col], edge_attr)
+
+        if not self.ignore_action:
+
+            if self.copy_action:
+                action_vec = utils.to_one_hot(
+                    action, self.action_dim).repeat(1, self.num_objects)
+                action_vec = action_vec.view(-1, self.action_dim)
+            else:
+                action_vec = utils.to_one_hot(
+                    action, self.action_dim * self.num_objects)
+                action_vec = action_vec.view(-1, self.action_dim)
+
+            # Attach action to each state
+            node_attr = th.cat([node_attr, action_vec], dim=-1)
+
+        node_attr = self._node_model(
+            node_attr, edge_index, edge_attr)
+
+        # [batch_size, num_nodes, output_dim]
+        gnn_result = node_attr.view(batch_size, self.num_objects, -1)
+        return self.head_module(gnn_result)
 
 
 class MultiInputActorCriticPolicy(ActorCriticPolicy):

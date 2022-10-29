@@ -503,3 +503,113 @@ def get_system_info(print_info: bool = True) -> Tuple[Dict[str, str], str]:
     if print_info:
         print(env_info_str)
     return env_info, env_info_str
+
+
+def get_act_fn(act_fn):
+    if act_fn == 'relu':
+        return th.nn.ReLU()
+    elif act_fn == 'leaky_relu':
+        return th.nn.LeakyReLU()
+    elif act_fn == 'elu':
+        return th.nn.ELU()
+    elif act_fn == 'sigmoid':
+        return th.nn.Sigmoid()
+    elif act_fn == 'softplus':
+        return th.nn.Softplus()
+    else:
+        raise ValueError('Invalid argument for `act_fn`.')
+
+
+def to_one_hot(indices, max_index):
+    """Get one-hot encoding of index tensors."""
+    zeros = th.zeros(
+        indices.size()[0], max_index, dtype=th.float32,
+        device=indices.device)
+    return zeros.scatter_(1, indices.unsqueeze(1), 1)
+
+
+def unsorted_segment_sum(tensor, segment_ids, num_segments):
+    """Custom PyTorch op to replicate TensorFlow's `unsorted_segment_sum`."""
+    result_shape = (num_segments, tensor.size(1))
+    result = tensor.new_full(result_shape, 0)  # Init empty result tensor.
+    segment_ids = segment_ids.unsqueeze(-1).expand(-1, tensor.size(1))
+    result.scatter_add_(0, segment_ids, tensor)
+    return result
+
+
+class ContrastiveLoss(th.nn.Module):
+    def __init__(self, hinge=1., sigma=0.5, detach_negative_state_embeddings=True, use_negative_sampling=True, reduce=False):
+        super(ContrastiveLoss, self).__init__()
+        self.hinge = hinge
+        self.sigma = sigma
+        self.reduce = reduce
+        self.detach_negative_state_embeddings = detach_negative_state_embeddings
+        self.use_negative_sampling = use_negative_sampling
+
+    def _energy(self, embedding, other_embedding):
+        """Energy function based on normalized squared L2 norm."""
+
+        norm = 0.5 / (self.sigma ** 2)
+        diff = embedding - other_embedding
+        result = norm * diff.pow(2).sum(1)
+
+        return result
+
+    def forward(self, state_embedding, next_state_embedding_true, next_state_embedding_prediction,
+                negative_state_embedding):
+        # Sample negative state across episodes at random
+        loss = self._energy(next_state_embedding_true, next_state_embedding_prediction)
+
+        if self.use_negative_sampling:
+            zeros = th.zeros_like(loss)
+            if self.detach_negative_state_embeddings:
+                negative_state_embedding = negative_state_embedding.detach()
+            neg_loss = th.max(zeros, self.hinge - self._energy(state_embedding, negative_state_embedding))
+            loss += neg_loss
+
+        if self.reduce:
+            loss = loss.mean()
+
+        return loss
+
+
+class RandomQueue:
+    def __init__(self, max_len, element_shape, dtype, backend='numpy', device=None):
+        self.max_len = max_len
+        self.size = (max_len, *element_shape)
+        self.backend = backend
+        if self.backend == 'numpy':
+            self.buffer = np.zeros(self.size, dtype=dtype)
+        elif self.backend == 'torch':
+            self.buffer = th.zeros(*self.size, dtype=dtype, device=device)
+        else:
+            raise ValueError(f'Invalid backend: {backend}.')
+        self.len = 0
+
+    def insert(self, batch):
+        if self.backend == 'numpy':
+            batch = batch.astype(self.buffer.dtype)
+        elif self.backend == 'torch':
+            batch = batch.type(self.buffer.dtype)
+        else:
+            raise ValueError(f'Invalid backend: {self.backend}.')
+
+        if self.len < self.max_len:
+            n = min(self.max_len - self.len, batch.shape[0])
+            self.buffer[self.len:self.len + n] = batch[:n]
+            batch = batch[n:]
+            self.len += n
+
+        if batch.shape[0] == 0:
+            return
+
+        self.buffer[np.random.choice(self.max_len, size=batch.shape[0], replace=False)] = batch
+
+    def sample(self, batch_size):
+        return self.buffer[np.random.choice(self.len, size=batch_size, replace=(self.len < batch_size))]
+
+    def __len__(self):
+        return self.len
+
+    def __str__(self):
+        return str(self.buffer)

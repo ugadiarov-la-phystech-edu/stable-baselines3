@@ -2,12 +2,13 @@ from itertools import zip_longest
 from typing import Dict, List, Tuple, Type, Union
 
 import gym
+import numpy as np
 import torch as th
 from torch import nn
 
 from stable_baselines3.common.preprocessing import get_flattened_obs_dim, is_image_space
 from stable_baselines3.common.type_aliases import TensorDict
-from stable_baselines3.common.utils import get_device
+from stable_baselines3.common.utils import get_device, get_act_fn
 
 
 class BaseFeaturesExtractor(nn.Module):
@@ -91,6 +92,169 @@ class NatureCNN(BaseFeaturesExtractor):
 
     def forward(self, observations: th.Tensor) -> th.Tensor:
         return self.linear(self.cnn(observations))
+
+
+class EncoderCNNSmall(nn.Module):
+    """CNN encoder, maps observation to obj-specific feature maps."""
+
+    def __init__(self, input_dim, hidden_dim, num_objects, act_fn='sigmoid',
+                 act_fn_hid='relu'):
+        super(EncoderCNNSmall, self).__init__()
+        self.cnn1 = nn.Conv2d(
+            input_dim, hidden_dim, (10, 10), stride=10)
+        self.cnn2 = nn.Conv2d(hidden_dim, num_objects, (1, 1), stride=1)
+        self.ln1 = nn.BatchNorm2d(hidden_dim)
+        self.act1 = get_act_fn(act_fn_hid)
+        self.act2 = get_act_fn(act_fn)
+
+    def forward(self, obs):
+        h = self.act1(self.ln1(self.cnn1(obs)))
+        return self.act2(self.cnn2(h))
+
+
+class EncoderCNNMedium(nn.Module):
+    """CNN encoder, maps observation to obj-specific feature maps."""
+
+    def __init__(self, input_dim, hidden_dim, num_objects, act_fn='sigmoid',
+                 act_fn_hid='leaky_relu'):
+        super(EncoderCNNMedium, self).__init__()
+
+        self.cnn1 = nn.Conv2d(
+            input_dim, hidden_dim, (9, 9), padding=4)
+        self.act1 = get_act_fn(act_fn_hid)
+        self.ln1 = nn.BatchNorm2d(hidden_dim)
+
+        self.cnn2 = nn.Conv2d(
+            hidden_dim, num_objects, (5, 5), stride=5)
+        self.act2 = get_act_fn(act_fn)
+
+    def forward(self, obs):
+        h = self.act1(self.ln1(self.cnn1(obs)))
+        h = self.act2(self.cnn2(h))
+        return h
+
+
+class EncoderCNNLarge(nn.Module):
+    """CNN encoder, maps observation to obj-specific feature maps."""
+
+    def __init__(self, input_dim, hidden_dim, num_objects, act_fn='sigmoid',
+                 act_fn_hid='relu'):
+        super(EncoderCNNLarge, self).__init__()
+
+        self.cnn1 = nn.Conv2d(input_dim, hidden_dim, (3, 3), padding=1)
+        self.act1 = get_act_fn(act_fn_hid)
+        self.ln1 = nn.BatchNorm2d(hidden_dim)
+
+        self.cnn2 = nn.Conv2d(hidden_dim, hidden_dim, (3, 3), padding=1)
+        self.act2 = get_act_fn(act_fn_hid)
+        self.ln2 = nn.BatchNorm2d(hidden_dim)
+
+        self.cnn3 = nn.Conv2d(hidden_dim, hidden_dim, (3, 3), padding=1)
+        self.act3 = get_act_fn(act_fn_hid)
+        self.ln3 = nn.BatchNorm2d(hidden_dim)
+
+        self.cnn4 = nn.Conv2d(hidden_dim, num_objects, (3, 3), padding=1)
+        self.act4 = get_act_fn(act_fn)
+
+    def forward(self, obs):
+        h = self.act1(self.ln1(self.cnn1(obs)))
+        h = self.act2(self.ln2(self.cnn2(h)))
+        h = self.act3(self.ln3(self.cnn3(h)))
+        return self.act4(self.cnn4(h))
+
+
+class EncoderMLP(nn.Module):
+    """MLP encoder, maps observation to latent state."""
+
+    def __init__(self, input_dim, output_dim, hidden_dim, num_objects,
+                 act_fn='relu'):
+        super(EncoderMLP, self).__init__()
+
+        self.num_objects = num_objects
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+
+        self.fc1 = nn.Linear(self.input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, output_dim)
+
+        self.ln = nn.LayerNorm(hidden_dim)
+
+        self.act1 = get_act_fn(act_fn)
+        self.act2 = get_act_fn(act_fn)
+
+    def forward(self, ins):
+        h_flat = ins.view(-1, self.num_objects, self.input_dim)
+        h = self.act1(self.fc1(h_flat))
+        h = self.act2(self.ln(self.fc2(h)))
+        return self.fc3(h).view(-1, self.num_objects * self.output_dim)
+
+
+class CSWMCNN(BaseFeaturesExtractor):
+    """Main module for a Contrastively-trained Structured World Model (C-SWM).
+
+    Args:
+        embedding_dim: Dimensionality of abstract state space.
+        input_dims: Shape of input observation.
+        hidden_dim: Number of hidden units in encoder and transition model.
+        action_dim: Dimensionality of action space.
+        num_objects: Number of object slots.
+    """
+
+    def __init__(self, observation_space: gym.spaces.Box, embedding_dim, hidden_dim,
+                 num_objects, encoder='large'):
+        super(CSWMCNN, self).__init__(observation_space, num_objects * embedding_dim)
+        # We assume CxHxW images (channels first)
+        # Re-ordering will be done by pre-preprocessing or wrapper
+        assert is_image_space(observation_space, check_channels=False), (
+            "You should use CSWMCNN "
+            f"only with images not with {observation_space}\n"
+            "(you are probably using `CnnPolicy` instead of `MlpPolicy` or `MultiInputPolicy`)\n"
+            "If you are using a custom environment,\n"
+            "please check it using our env checker:\n"
+            "https://stable-baselines3.readthedocs.io/en/master/common/env_checker.html"
+        )
+
+        self.hidden_dim = hidden_dim
+        self.embedding_dim = embedding_dim
+        self.num_objects = num_objects
+
+        num_channels = observation_space.shape[0]
+        width_height = observation_space.shape[1:]
+
+        if encoder == 'small':
+            self.obj_extractor = EncoderCNNSmall(
+                input_dim=num_channels,
+                hidden_dim=hidden_dim // 16,
+                num_objects=num_objects)
+            # CNN image size changes
+            width_height = np.array(width_height)
+            width_height = width_height // 10
+        elif encoder == 'medium':
+            self.obj_extractor = EncoderCNNMedium(
+                input_dim=num_channels,
+                hidden_dim=hidden_dim // 16,
+                num_objects=num_objects)
+            # CNN image size changes
+            width_height = np.array(width_height)
+            width_height = width_height // 5
+        elif encoder == 'large':
+            self.obj_extractor = EncoderCNNLarge(
+                input_dim=num_channels,
+                hidden_dim=hidden_dim // 16,
+                num_objects=num_objects)
+
+        self.obj_encoder = EncoderMLP(
+            input_dim=np.prod(width_height),
+            hidden_dim=hidden_dim,
+            output_dim=embedding_dim,
+            num_objects=num_objects)
+
+        self.width = width_height[0]
+        self.height = width_height[1]
+
+    def forward(self, obs):
+        return self.obj_encoder(self.obj_extractor(obs))
 
 
 def create_mlp(

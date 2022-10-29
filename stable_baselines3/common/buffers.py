@@ -448,6 +448,7 @@ class RolloutBuffer(BaseBuffer):
                 "log_probs",
                 "advantages",
                 "returns",
+                "episode_starts"
             ]
 
             for tensor in _tensor_names:
@@ -471,6 +472,7 @@ class RolloutBuffer(BaseBuffer):
             self.log_probs[batch_inds].flatten(),
             self.advantages[batch_inds].flatten(),
             self.returns[batch_inds].flatten(),
+            self.episode_starts[batch_inds].flatten()
         )
         return RolloutBufferSamples(*tuple(map(self.to_torch, data)))
 
