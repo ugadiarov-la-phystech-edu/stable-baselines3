@@ -2,7 +2,7 @@ import glob
 import os
 import platform
 import random
-from collections import deque
+from collections import deque, defaultdict
 from itertools import zip_longest
 from typing import Dict, Iterable, Optional, Tuple, Union
 
@@ -613,3 +613,46 @@ class RandomQueue:
 
     def __str__(self):
         return str(self.buffer)
+
+
+def pairwise_distance_matrix(x, y):
+    num_samples = x.size(0)
+    dim = x.size(1)
+
+    x = x.unsqueeze(1).expand(num_samples, num_samples, dim)
+    y = y.unsqueeze(0).expand(num_samples, num_samples, dim)
+
+    return th.pow(x - y, 2).sum(2)
+
+
+def rank_metrics(next_state_embedding_true, next_state_embedding_prediction):
+    next_state_embedding_prediction = next_state_embedding_prediction.flatten(start_dim=1)
+    next_state_embedding_true = next_state_embedding_true.flatten(start_dim=1)
+    dist_matrix = pairwise_distance_matrix(next_state_embedding_true, next_state_embedding_prediction)
+    dist_matrix_diag = th.diag(dist_matrix).unsqueeze(-1)
+    dist_matrix_augmented = th.cat([dist_matrix_diag, dist_matrix], dim=1)
+
+    # Workaround to get a stable sort in numpy.
+    dist_np = dist_matrix_augmented.detach().cpu().numpy()
+    indices = []
+    for row in dist_np:
+        keys = (np.arange(len(row)), row)
+        indices.append(np.lexsort(keys))
+    indices = np.stack(indices, axis=0)
+    indices = th.from_numpy(indices).long()
+
+    labels = th.zeros(indices.size(0), device=indices.device, dtype=th.int64).unsqueeze(-1)
+    num_samples = next_state_embedding_prediction.size()[0]
+
+    match = indices[:, :1] == labels
+    num_matches = match.sum()
+    hits_at = defaultdict(int)
+    hits_at[1] += num_matches.item()
+
+    match = indices == labels
+    _, ranks = match.max(1)
+
+    reciprocal_ranks = th.reciprocal(ranks.double() + 1)
+    rr_sum = reciprocal_ranks.sum().item()
+
+    return {'Hits@1': hits_at[1] / float(num_samples), 'MRR': rr_sum / float(num_samples)}

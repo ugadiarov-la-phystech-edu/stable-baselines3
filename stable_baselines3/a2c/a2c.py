@@ -7,7 +7,7 @@ from torch.nn import functional as F
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
-from stable_baselines3.common.utils import explained_variance, RandomQueue
+from stable_baselines3.common.utils import explained_variance, RandomQueue, rank_metrics
 
 
 class A2C(OnPolicyAlgorithm):
@@ -78,7 +78,8 @@ class A2C(OnPolicyAlgorithm):
         state_criterion_kwargs: Optional[Dict[str, Any]] = {},
         state_coef: float = 0.0,
         state_buffer_class=RandomQueue,
-        state_buffer_kwargs: Optional[Dict[str, Any]] = {}
+        state_buffer_kwargs: Optional[Dict[str, Any]] = {},
+        compute_state_prediction_metrics: bool = True
     ):
 
         super(A2C, self).__init__(
@@ -117,6 +118,7 @@ class A2C(OnPolicyAlgorithm):
         self.state_buffer_class = state_buffer_class
         self.state_buffer_kwargs = state_buffer_kwargs
         self.state_buffer = None
+        self.compute_state_prediction_metrics = compute_state_prediction_metrics
 
         # Update optimizer inside the policy if we want to use RMSProp
         # (original implementation) rather than Adam
@@ -151,6 +153,8 @@ class A2C(OnPolicyAlgorithm):
                 self.state_buffer = self.state_buffer_class(**kwargs)
 
             self.state_buffer.insert(observations)
+
+        metrics = {}
 
         # This will only loop once (get all data in one go)
         for rollout_data in self.rollout_buffer.get(batch_size=None):
@@ -190,6 +194,9 @@ class A2C(OnPolicyAlgorithm):
                 next_state_embedding_true = state_embedding[1:]
                 state_embedding = state_embedding[:-1]
                 transition = transition[:-1]
+                if self.compute_state_prediction_metrics:
+                    metrics.update(rank_metrics(next_state_embedding_true, state_embedding + transition))
+
                 episode_not_done = 1 - rollout_data.episode_starts[1:].unsqueeze(1).expand(-1, state_embedding.size()[1]).flatten()
 
                 negative_observations = th.from_numpy(self.state_buffer.sample(state_embedding.size()[0])).to(self.device)
@@ -225,6 +232,9 @@ class A2C(OnPolicyAlgorithm):
         self.logger.record("train/loss", loss.item())
         if self.predict_transition:
             self.logger.record("train/state_loss", state_loss.item())
+
+        for metric, value in metrics.items():
+            self.logger.record(f"train/{metric}", value)
 
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
