@@ -218,7 +218,7 @@ class A2C(OnPolicyAlgorithm):
             loss.backward()
 
             # Clip grad norm
-            th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            gran_norm = th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.policy.optimizer.step()
 
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
@@ -230,6 +230,7 @@ class A2C(OnPolicyAlgorithm):
         self.logger.record("train/policy_gradient_loss", policy_loss.item())
         self.logger.record("train/value_loss", value_loss.item())
         self.logger.record("train/loss", loss.item())
+        self.logger.record("train/grad_norm", gran_norm.item())
         if self.predict_transition:
             self.logger.record("train/state_loss", state_loss.item())
 
