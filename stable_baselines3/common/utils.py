@@ -551,9 +551,9 @@ class ContrastiveLoss(th.nn.Module):
 
         norm = 0.5 / (self.sigma ** 2)
         diff = embedding - other_embedding
-        result = norm * diff.pow(2).sum(1)
+        energy = norm * diff.pow(2).sum(2).mean(1)
 
-        return result
+        return energy
 
     def forward(self, state_embedding, next_state_embedding_true, next_state_embedding_prediction,
                 negative_state_embedding):

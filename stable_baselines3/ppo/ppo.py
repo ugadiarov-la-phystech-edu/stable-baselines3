@@ -9,7 +9,7 @@ from torch.nn import functional as F
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
-from stable_baselines3.common.utils import explained_variance, get_schedule_fn, RandomQueue
+from stable_baselines3.common.utils import explained_variance, get_schedule_fn, RandomQueue, rank_metrics
 
 
 class PPO(OnPolicyAlgorithm):
@@ -95,7 +95,8 @@ class PPO(OnPolicyAlgorithm):
         state_criterion_kwargs: Optional[Dict[str, Any]] = {},
         state_coef: float = 0.0,
         state_buffer_class=RandomQueue,
-        state_buffer_kwargs: Optional[Dict[str, Any]] = {}
+        state_buffer_kwargs: Optional[Dict[str, Any]] = {},
+        compute_state_prediction_metrics: bool = True
     ):
 
         super(PPO, self).__init__(
@@ -164,6 +165,7 @@ class PPO(OnPolicyAlgorithm):
         self.state_buffer_class = state_buffer_class
         self.state_buffer_kwargs = state_buffer_kwargs
         self.state_buffer = None
+        self.compute_state_prediction_metrics = compute_state_prediction_metrics
 
         if _init_setup_model:
             self._setup_model()
@@ -178,10 +180,6 @@ class PPO(OnPolicyAlgorithm):
                 assert self.clip_range_vf > 0, "`clip_range_vf` must be positive, " "pass `None` to deactivate vf clipping"
 
             self.clip_range_vf = get_schedule_fn(self.clip_range_vf)
-
-    @staticmethod
-    def _flatten_over_objects(state_embedding):
-        return state_embedding.view(-1, state_embedding.size()[-1])
 
     def train(self) -> None:
         """
@@ -201,6 +199,7 @@ class PPO(OnPolicyAlgorithm):
         pg_losses, value_losses = [], []
         state_losses = []
         clip_fractions = []
+        metrics = {}
 
         continue_training = True
 
@@ -214,6 +213,26 @@ class PPO(OnPolicyAlgorithm):
 
             self.state_buffer.insert(observations)
 
+            if self.compute_state_prediction_metrics:
+                self.policy.eval()
+                with th.no_grad():
+                    rollout_data = next(self.rollout_buffer.get(batch_size=None))
+
+                    actions = rollout_data.actions
+                    if isinstance(self.action_space, spaces.Discrete):
+                        # Convert discrete action from float to long
+                        actions = actions.long().flatten()
+
+                    _, _, _, state_embedding, transition = self.policy.evaluate_actions(
+                        rollout_data.observations, actions, predict_transition=self.predict_transition)
+
+                    next_state_embedding_true = state_embedding[1:]
+                    state_embedding = state_embedding[:-1]
+                    transition = transition[:-1]
+
+                    metrics.update(rank_metrics(next_state_embedding_true, state_embedding + transition))
+
+        self.policy.train()
         # train for n_epochs epochs
         for epoch in range(self.n_epochs):
             approx_kl_divs = []
@@ -277,17 +296,15 @@ class PPO(OnPolicyAlgorithm):
                 if self.predict_transition:
                     assert state_embedding is not None
                     assert transition is not None
+
                     next_state_embedding_true = state_embedding[1:]
                     state_embedding = state_embedding[:-1]
                     transition = transition[:-1]
-                    episode_not_done = 1 - rollout_data.episode_starts[1:].unsqueeze(1).expand(-1, state_embedding.size()[1]).flatten()
+                    episode_not_done = 1 - rollout_data.episode_starts[1:]
 
                     negative_observations = th.from_numpy(self.state_buffer.sample(state_embedding.size()[0])).to(self.device)
-                    negative_state_embedding = self._flatten_over_objects(self.policy.extract_features(negative_observations)
-                                                                          .view(*state_embedding.size()))
-                    state_embedding = self._flatten_over_objects(state_embedding)
-                    next_state_embedding_true = self._flatten_over_objects(next_state_embedding_true)
-                    transition = self._flatten_over_objects(transition)
+                    negative_state_embedding = self.policy.extract_features(negative_observations)\
+                        .view(*state_embedding.size())
 
                     state_loss = self.state_criterion(
                         state_embedding, next_state_embedding_true, state_embedding + transition,
@@ -333,10 +350,14 @@ class PPO(OnPolicyAlgorithm):
         self.logger.record("train/clip_fraction", np.mean(clip_fractions))
         self.logger.record("train/loss", loss.item())
         self.logger.record("train/explained_variance", explained_var)
-        if hasattr(self.policy, "log_std"):
-            self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
         if self.predict_transition:
             self.logger.record("train/state_loss", np.mean(state_losses))
+
+        for metric, value in metrics.items():
+            self.logger.record(f"train/{metric}", value)
+
+        if hasattr(self.policy, "log_std"):
+            self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
 
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         self.logger.record("train/clip_range", clip_range)
