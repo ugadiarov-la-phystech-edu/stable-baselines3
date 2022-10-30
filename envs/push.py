@@ -63,6 +63,15 @@ class Push(gym.Env):
             # channels are n_goals, n_boxes, n_obstacles, time remaining
         elif self.observation_type == 'squares':
             self.observation_space = spaces.Box(0, 255, (self.w * self.render_scale, self.w * self.render_scale, 3), dtype=np.uint8)
+        elif self.observation_type == 'object-wise':
+            assert self.n_obstacles == 0
+            assert not self.walls
+            self.observation_space = spaces.Box(
+                0,
+                255,
+                (self.w * self.render_scale, self.w * self.render_scale, self.n_boxes + self.n_goals),
+                dtype=np.uint8
+            )
         else:
             raise ValueError(f'Invalid observation_type: {self.observation_type}.')
 
@@ -85,15 +94,13 @@ class Push(gym.Env):
     def _get_observation(self):
         if self.observation_type == 'grid':
             return self.state
-        elif self.observation_type == 'squares':
+        elif self.observation_type == 'squares' or self.observation_type == 'object-wise':
             return self.render_squares()
         else:
             raise ValueError(f'Invalid observation type: {self.observation_type}.')
 
     def reset(self):
-        state = np.zeros([self.w, self.w, self.n_goals + self.n_boxes + self.n_obstacles + 1])
-        # initialise time-remaining to 1.
-        state[:, :, self.n_goals + self.n_boxes + self.n_obstacles].fill(1)
+        state = np.zeros([self.w, self.w, self.n_goals + self.n_boxes + self.n_obstacles])
 
         # fill in walls at borders
         if self.walls:
@@ -240,18 +247,28 @@ class Push(gym.Env):
         return ["down", "left", "up", "right"] * self.n_boxes
 
     def render_squares(self):
-        im = np.zeros((self.w * self.render_scale, self.w * self.render_scale, 3), dtype=np.float32)
+        im = np.zeros(self.observation_space.shape, dtype=np.float32)
         for idx, pos in enumerate(self.box_pos):
             if pos[0] == -1:
                 assert pos[1] == -1
                 continue
 
             rr, cc = square(pos[0] * self.render_scale, pos[1] * self.render_scale, self.render_scale, im.shape)
-            im[rr, cc, :] = self.colors[idx][:3]
+            if self.observation_type == 'object-wise':
+                im[rr, cc, idx] = 1
+            elif self.observation_type == 'squares':
+                im[rr, cc, :] = self.colors[idx][:3]
+            else:
+                assert False, 'Cannot happen!'
 
         for idx, pos in enumerate(self.goal_pos):
             rr, cc = square(pos[0] * self.render_scale, pos[1] * self.render_scale, self.render_scale, im.shape)
-            im[rr, cc, :] = 1
+            if self.observation_type == 'object-wise':
+                im[rr, cc, idx + self.n_boxes] = 1
+            elif self.observation_type == 'squares':
+                im[rr, cc, :] = 1
+            else:
+                assert False, 'Cannot happen!'
 
         if self.channels_first:
             im = im.transpose([2, 0, 1])

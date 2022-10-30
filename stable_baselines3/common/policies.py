@@ -823,7 +823,7 @@ class ActorCriticCSWMPolicy(BasePolicy):
         self.value_net_head_type = value_net_head_type
 
         self.features_extractor = features_extractor_class(
-            self.observation_space, self.embedding_dim, self.hidden_dim, self.num_objects,
+            self.observation_space, self.embedding_dim, self.hidden_dim,
             **self.features_extractor_kwargs
         )
         self.features_dim = self.features_extractor.features_dim

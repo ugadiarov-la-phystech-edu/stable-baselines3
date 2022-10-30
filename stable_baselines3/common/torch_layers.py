@@ -257,6 +257,82 @@ class CSWMCNN(BaseFeaturesExtractor):
         return self.obj_encoder(self.obj_extractor(obs))
 
 
+class CSWMCNNObjectWise(BaseFeaturesExtractor):
+    """Main module for a Contrastively-trained Structured World Model (C-SWM).
+
+    Args:
+        embedding_dim: Dimensionality of abstract state space.
+        input_dims: Shape of input observation.
+        hidden_dim: Number of hidden units in encoder and transition model.
+        action_dim: Dimensionality of action space.
+        num_objects: Number of object slots.
+    """
+
+    def __init__(self, observation_space: gym.spaces.Box, embedding_dim, hidden_dim,
+                 num_boxes, num_goals, encoder='large'):
+        super(CSWMCNNObjectWise, self).__init__(observation_space, (num_boxes + num_goals) * embedding_dim)
+        # We assume CxHxW images (channels first)
+        # Re-ordering will be done by pre-preprocessing or wrapper
+        assert is_image_space(observation_space, check_channels=False), (
+            "You should use CSWMCNN "
+            f"only with images not with {observation_space}\n"
+            "(you are probably using `CnnPolicy` instead of `MlpPolicy` or `MultiInputPolicy`)\n"
+            "If you are using a custom environment,\n"
+            "please check it using our env checker:\n"
+            "https://stable-baselines3.readthedocs.io/en/master/common/env_checker.html"
+        )
+
+        self.hidden_dim = hidden_dim
+        self.embedding_dim = embedding_dim
+        self.num_boxes = num_boxes
+        self.num_goals = num_goals
+
+        num_channels = 1
+        width_height = observation_space.shape[1:]
+
+        if encoder == 'small':
+            self.obj_extractor = EncoderCNNSmall(
+                input_dim=num_channels,
+                hidden_dim=hidden_dim // 16,
+                num_objects=1)
+            # CNN image size changes
+            width_height = np.array(width_height)
+            width_height = width_height // 10
+        elif encoder == 'medium':
+            self.obj_extractor = EncoderCNNMedium(
+                input_dim=num_channels,
+                hidden_dim=hidden_dim // 16,
+                num_objects=1)
+            # CNN image size changes
+            width_height = np.array(width_height)
+            width_height = width_height // 5
+        elif encoder == 'large':
+            self.obj_extractor = EncoderCNNLarge(
+                input_dim=num_channels,
+                hidden_dim=hidden_dim // 16,
+                num_objects=1)
+
+        self.obj_encoder = EncoderMLP(
+            input_dim=np.prod(width_height),
+            hidden_dim=hidden_dim,
+            output_dim=embedding_dim,
+            num_objects=1)
+
+        self.width = width_height[0]
+        self.height = width_height[1]
+
+    def forward(self, obs):
+        batch_size, num_objects, width, height = obs.size()
+        assert num_objects == self.num_boxes + self.num_goals, f'num_objects={num_objects},' \
+                                                               f' num_boxes={self.num_boxes},' \
+                                                               f' num_goals={self.num_goals}'
+
+        embedding = self.obj_encoder(
+            self.obj_extractor(obs.reshape(batch_size * num_objects, width, height).unsqueeze(1))
+        )
+        return embedding.view(batch_size, num_objects * self.embedding_dim)
+
+
 def create_mlp(
     input_dim: int,
     output_dim: int,
