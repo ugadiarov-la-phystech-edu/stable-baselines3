@@ -199,6 +199,7 @@ class PPO(OnPolicyAlgorithm):
         pg_losses, value_losses = [], []
         state_losses = []
         clip_fractions = []
+        grad_norms = []
         metrics = {}
 
         continue_training = True
@@ -333,7 +334,8 @@ class PPO(OnPolicyAlgorithm):
                 self.policy.optimizer.zero_grad()
                 loss.backward()
                 # Clip grad norm
-                th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                grad_norm = th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                grad_norms.append(grad_norm.item())
                 self.policy.optimizer.step()
 
             if not continue_training:
@@ -350,6 +352,7 @@ class PPO(OnPolicyAlgorithm):
         self.logger.record("train/clip_fraction", np.mean(clip_fractions))
         self.logger.record("train/loss", loss.item())
         self.logger.record("train/explained_variance", explained_var)
+        self.logger.record("train/grad_norm", np.mean(grad_norms))
         if self.predict_transition:
             self.logger.record("train/state_loss", np.mean(state_losses))
 
