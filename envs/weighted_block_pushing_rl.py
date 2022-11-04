@@ -134,7 +134,7 @@ class BlockPushingRL(gym.Env):
 
     def __init__(self, width=10, height=10, render_type='cubes',
                  *, num_objects=3, scale=5, mode='Train', cmap='Set1', typ='Observed',
-                 num_weights=None, seed=None, observation_full_state=False):
+                 num_weights=None, seed=None, observation_full_state=False, max_episode_steps=100, reward_type='dense'):
         self.observation_full_state = observation_full_state
         self.width = width
         self.height = height
@@ -144,6 +144,11 @@ class BlockPushingRL(gym.Env):
         self.typ = typ
         self.scale = scale
         self.new_colors = None
+        self._max_episode_steps = max_episode_steps
+        self._episode_steps = None
+        self.step_reward = -0.01
+        self.reward_type = reward_type
+        assert reward_type in ('sparse', 'dense')
 
         if typ in ['Unobserved', 'FixedUnobserved'] and "FewShot" in mode:
             self.n_f = int(mode[-1])
@@ -271,7 +276,7 @@ class BlockPushingRL(gym.Env):
     def get_sparse_reward(self):
         num_hits = len([idx for idx, obj in self.objects.items() if obj.pos == self.target_objects[idx].pos])
 
-        return num_hits / self.num_objects
+        return num_hits / self.num_objects + self.step_reward
 
     def get_dense_reward(self):
         distance = 0.0
@@ -279,7 +284,7 @@ class BlockPushingRL(gym.Env):
             distance += np.abs(self.objects[i].pos.x - self.target_objects[i].pos.x) +\
                         np.abs(self.objects[i].pos.y - self.target_objects[i].pos.y)
 
-        return -distance / self.num_objects
+        return -distance / self.num_objects / self.width / self.height
 
     def _sample_positions(self, n):
         locations = np.random.choice(self.width * self.height, n, replace=False)
@@ -287,6 +292,7 @@ class BlockPushingRL(gym.Env):
         return list(zip(xs, ys))
 
     def reset(self):
+        self._episode_steps = 0
         if self.typ == 'FixedUnobserved' or self.typ == 'Observed':
             self.shapes = np.arange(self.num_objects)
         elif self.mode == 'ZeroShotShape':
@@ -374,7 +380,16 @@ class BlockPushingRL(gym.Env):
         self.objects[obj_id] = Object(
             pos=obj.pos+offset, weight=obj.weight)
 
+    def _get_reward(self):
+        if self.reward_type == 'sparse':
+            return self.get_sparse_reward()
+        elif self.reward_type == 'dense':
+            return self.get_dense_reward()
+        else:
+            assert False, f'Invalid reward type: {self.reward_type}'
+
     def step(self, action: int):
+        self._episode_steps += 1
         directions = [Coord(0, 0),
                       Coord(-1, 0),
                       Coord(0, 1),
@@ -394,12 +409,10 @@ class BlockPushingRL(gym.Env):
 
         img = self._get_observation()
 
-        # reward = self.get_sparse_reward(self.target[0])
-        reward = self.get_dense_reward()
         num_hits = len([idx for idx, obj in self.objects.items() if obj.pos == self.target_objects[idx].pos])
-        done = (num_hits == self.num_objects)
+        done = (num_hits == self.num_objects or self._episode_steps >= self._max_episode_steps)
 
-        return img, reward, done, info
+        return img, self._get_reward(), done, info
 
     def sample_step(self, action: int):
         directions = [Coord(0, 0),
@@ -421,11 +434,10 @@ class BlockPushingRL(gym.Env):
         except InvalidPush:
             info['invalid_push'] = True
 
-        reward = self.get_dense_reward()
         next_obs = self._get_observation()
         self.objects = objects
 
-        return reward, next_obs
+        return self._get_reward(), next_obs
 
     def get_target(self, num_steps):
         objects = self.objects.copy()
