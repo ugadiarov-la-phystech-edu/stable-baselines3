@@ -248,9 +248,15 @@ class PPO(OnPolicyAlgorithm):
                 if self.use_sde:
                     self.policy.reset_noise(self.batch_size)
 
-                values, log_prob, entropy, state_embedding, transition = self.policy.evaluate_actions(
-                    rollout_data.observations, actions, predict_transition=self.predict_transition
-                )
+                evaluation_result = self.policy.evaluate_actions(rollout_data.observations, actions)
+                if len(evaluation_result) == 3:
+                    values, log_prob, entropy = evaluation_result
+                    state_embedding = transition = None
+                elif len(evaluation_result) == 5:
+                    values, log_prob, entropy, state_embedding, transition = evaluation_result
+                else:
+                    assert False, f'Unexpected length of evaluation result: {len(evaluation_result)}'
+
                 values = values.flatten()
                 # Normalize advantage
                 advantages = rollout_data.advantages
