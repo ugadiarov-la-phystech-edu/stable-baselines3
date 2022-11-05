@@ -148,7 +148,8 @@ class BlockPushingRL(gym.Env):
         self._episode_steps = None
         self.step_reward = -0.01
         self.reward_type = reward_type
-        assert reward_type in ('sparse', 'dense')
+        assert reward_type in ('sparse', 'dense', 'sparse-achievement', 'sparse-achievement-strict'),\
+            f'Invalid reward type: {self.reward_type}'
 
         if typ in ['Unobserved', 'FixedUnobserved'] and "FewShot" in mode:
             self.n_f = int(mode[-1])
@@ -171,6 +172,7 @@ class BlockPushingRL(gym.Env):
         # Initialize to pos outside of env for easier collision resolution.
         self.objects = OrderedDict()
         self.target_objects = OrderedDict()
+        self.achievements = None
 
         # If True, then check for collisions and don't allow two
         #   objects to occupy the same position.
@@ -278,6 +280,26 @@ class BlockPushingRL(gym.Env):
 
         return num_hits / self.num_objects + self.step_reward
 
+    def get_sparse_achievement_reward(self):
+        reward = self.step_reward
+        for idx, obj in self.objects.items():
+            if not self.achievements[idx] and obj.pos == self.target_objects[idx].pos:
+                reward += 1
+                self.achievements[idx] = True
+
+        return reward
+
+    def get_sparse_achievement_strict_reward(self):
+        reward = self.step_reward
+        for idx, obj in self.objects.items():
+            if not self.achievements[idx] and obj.pos == self.target_objects[idx].pos:
+                self.achievements[idx] = True
+
+        if sum(self.achievements) == self.num_objects:
+            reward += 1
+
+        return reward
+
     def get_dense_reward(self):
         distance = 0.0
         for i in range(self.num_objects):
@@ -318,11 +340,13 @@ class BlockPushingRL(gym.Env):
                 mode=self.mode,
                 new_colors=self.new_colors)
 
+        self.achievements = []
         # Randomize object position.
         for idx, position in enumerate(self._sample_positions(self.num_objects)):
             self.objects[idx] = Object(pos=Coord(x=position[0], y=position[1]), weight=weights[idx])
         for idx, position in enumerate(self._sample_positions(self.num_objects)):
             self.target_objects[idx] = Object(pos=Coord(x=position[0], y=position[1]), weight=None)
+            self.achievements.append(self.target_objects[idx].pos == self.objects[idx].pos)
 
         return self._get_observation()
 
@@ -385,6 +409,10 @@ class BlockPushingRL(gym.Env):
             return self.get_sparse_reward()
         elif self.reward_type == 'dense':
             return self.get_dense_reward()
+        elif self.reward_type == 'sparse-achievement':
+            return self.get_sparse_achievement_reward()
+        elif self.reward_type == 'sparse-achievement-strict':
+            return self.get_sparse_achievement_strict_reward()
         else:
             assert False, f'Invalid reward type: {self.reward_type}'
 
@@ -408,9 +436,12 @@ class BlockPushingRL(gym.Env):
             info['invalid_push'] = True
 
         img = self._get_observation()
-
-        num_hits = len([idx for idx, obj in self.objects.items() if obj.pos == self.target_objects[idx].pos])
-        done = (num_hits == self.num_objects or self._episode_steps >= self._max_episode_steps)
+        done = self._episode_steps >= self._max_episode_steps
+        if self.reward_type == 'sparse-achievement':
+            done = done or sum(self.achievements) == self.num_objects
+        else:
+            num_hits = len([idx for idx, obj in self.objects.items() if obj.pos == self.target_objects[idx].pos])
+            done = done or num_hits == self.num_objects
 
         return img, self._get_reward(), done, info
 
