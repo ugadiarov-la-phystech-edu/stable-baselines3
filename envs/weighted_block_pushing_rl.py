@@ -1,4 +1,6 @@
 """Gym environment for block pushing tasks (2D Shapes and 3D Cubes)."""
+import itertools
+
 import numpy as np
 
 import gym
@@ -133,7 +135,7 @@ class BlockPushingRL(gym.Env):
     """Gym environment for block pushing task."""
 
     def __init__(self, width=10, height=10, render_type='cubes',
-                 *, num_objects=3, scale=5, mode='Train', cmap='Set1', typ='Observed',
+                 *, num_objects=4, scale=5, mode='Train', cmap='Set1', typ='Observed',
                  num_weights=None, seed=None, observation_full_state=False, max_episode_steps=100, reward_type='dense'):
         self.observation_full_state = observation_full_state
         self.width = width
@@ -181,7 +183,7 @@ class BlockPushingRL(gym.Env):
         self.action_space = spaces.Discrete(self.num_actions)
         self.observation_space = spaces.Box(
             low=0, high=255,
-            shape=(self.width * self.scale, self.height * self.scale, 6),
+            shape=(self.width * self.scale, self.height * self.scale, 3),
             dtype=np.uint8
         )
 
@@ -263,8 +265,7 @@ class BlockPushingRL(gym.Env):
         )[self.render_type]
 
         objects_image = render(self.objects)
-        target_image = render(self.target_objects)
-        return np.concatenate([objects_image, target_image], axis=-1)
+        return objects_image
 
     def get_state(self):
         im = np.zeros(
@@ -344,7 +345,10 @@ class BlockPushingRL(gym.Env):
         # Randomize object position.
         for idx, position in enumerate(self._sample_positions(self.num_objects)):
             self.objects[idx] = Object(pos=Coord(x=position[0], y=position[1]), weight=weights[idx])
-        for idx, position in enumerate(self._sample_positions(self.num_objects)):
+        for idx, position in enumerate(itertools.product([0, self.width - 1], [0, self.height - 1])):
+            if idx >= len(self.objects):
+                break
+
             self.target_objects[idx] = Object(pos=Coord(x=position[0], y=position[1]), weight=None)
             self.achievements.append(self.target_objects[idx].pos == self.objects[idx].pos)
 
