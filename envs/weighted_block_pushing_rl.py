@@ -134,6 +134,8 @@ class InvalidPush(BaseException):
 class BlockPushingRL(gym.Env):
     """Gym environment for block pushing task."""
 
+    metadata = {'render.modes': ['rgb_array'], "video.frames_per_second": 4}
+
     def __init__(self, width=10, height=10, render_type='cubes',
                  *, num_objects=4, scale=5, mode='Train', cmap='Set1', typ='Observed',
                  num_weights=None, seed=None, observation_full_state=False, max_episode_steps=100, reward_type='dense'):
@@ -226,10 +228,10 @@ class BlockPushingRL(gym.Env):
                 rr, cc = square(
                     obj.pos.x * self.scale, obj.pos.y * self.scale, self.scale, im.shape)
             elif self.shapes[idx] == 3:
-                rr, cc = diamond(
+                rr, cc = cross(
                     obj.pos.x * self.scale, obj.pos.y * self.scale, self.scale, im.shape)
             elif self.shapes[idx] == 4:
-                rr, cc = cross(
+                rr, cc = diamond(
                     obj.pos.x * self.scale, obj.pos.y * self.scale, self.scale, im.shape)
             elif self.shapes[idx] == 5:
                 rr, cc = pentagon(
@@ -256,7 +258,7 @@ class BlockPushingRL(gym.Env):
         else:
             return self.render()
 
-    def render(self):
+    def render(self, *args, **kwargs):
         render = dict(
             grid=self.render_grid,
             circles=self.render_circles,
@@ -307,7 +309,7 @@ class BlockPushingRL(gym.Env):
             distance += np.abs(self.objects[i].pos.x - self.target_objects[i].pos.x) +\
                         np.abs(self.objects[i].pos.y - self.target_objects[i].pos.y)
 
-        return -distance / self.num_objects / self.width / self.height
+        return -distance / self.num_objects / (self.width + self.height)
 
     def _sample_positions(self, n):
         locations = np.random.choice(self.width * self.height, n, replace=False)
