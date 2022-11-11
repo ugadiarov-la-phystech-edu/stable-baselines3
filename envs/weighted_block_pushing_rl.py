@@ -138,7 +138,8 @@ class BlockPushingRL(gym.Env):
 
     def __init__(self, width=10, height=10, render_type='cubes',
                  *, num_objects=4, scale=5, mode='Train', cmap='Set1', typ='Observed',
-                 num_weights=None, seed=None, observation_full_state=False, max_episode_steps=100, reward_type='dense'):
+                 num_weights=None, seed=None, observation_full_state=False, max_episode_steps=100, reward_type='dense',
+                 inactivate_object_on_hit=False):
         self.observation_full_state = observation_full_state
         self.width = width
         self.height = height
@@ -164,6 +165,7 @@ class BlockPushingRL(gym.Env):
             else:
                 print("something went wrong")
 
+        self.inactivate_object_on_hit = inactivate_object_on_hit
         self.num_objects = num_objects
         self.num_actions = 5 * self.num_objects  # Move StayNESW
         if num_weights is None:
@@ -434,12 +436,13 @@ class BlockPushingRL(gym.Env):
         obj_id = action // 5
 
         info = {'invalid_push': False}
-        try:
-            self.translate(obj_id, directions[direction])
-        except InvalidMove:
-            pass
-        except InvalidPush:
-            info['invalid_push'] = True
+        if not self.achievements[obj_id]:
+            try:
+                self.translate(obj_id, directions[direction])
+            except InvalidMove:
+                pass
+            except InvalidPush:
+                info['invalid_push'] = True
 
         img = self._get_observation()
         done = self._episode_steps >= self._max_episode_steps
