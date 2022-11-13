@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import gym
 import numpy as np
+import schnetpack as spk
 import torch as th
 from torch import nn
 
@@ -818,6 +819,334 @@ class MultiInputActorCriticPolicy(ActorCriticPolicy):
             optimizer_class,
             optimizer_kwargs,
         )
+
+
+class ActorCriticGNNPolicy(BasePolicy):
+    """
+    Policy class for actor-critic algorithms (has both policy and value prediction).
+    Used by A2C, PPO and the likes.
+
+    :param observation_space: Observation space
+    :param action_space: Action space
+    :param lr_schedule: Learning rate schedule (could be constant)
+    :param net_arch: The specification of the policy and value networks.
+    :param activation_fn: Activation function
+    :param ortho_init: Whether to use or not orthogonal initialization
+    :param use_sde: Whether to use State Dependent Exploration or not
+    :param log_std_init: Initial value for the log standard deviation
+    :param full_std: Whether to use (n_features x n_actions) parameters
+        for the std instead of only (n_features,) when using gSDE
+    :param sde_net_arch: Network architecture for extracting features
+        when using gSDE. If None, the latent features from the policy will be used.
+        Pass an empty list to use the states as features.
+    :param use_expln: Use ``expln()`` function instead of ``exp()`` to ensure
+        a positive standard deviation (cf paper). It allows to keep variance
+        above zero and prevent it from growing too fast. In practice, ``exp()`` is usually enough.
+    :param squash_output: Whether to squash the output using a tanh function,
+        this allows to ensure boundaries when using gSDE.
+    :param features_extractor_class: Features extractor to use.
+    :param features_extractor_kwargs: Keyword arguments
+        to pass to the features extractor.
+    :param normalize_images: Whether to normalize images or not,
+         dividing by 255.0 (True by default)
+    :param optimizer_class: The optimizer to use,
+        ``th.optim.Adam`` by default
+    :param optimizer_kwargs: Additional keyword arguments,
+        excluding the learning rate, to pass to the optimizer
+    """
+
+    def __init__(
+        self,
+        observation_space: gym.spaces.Space,
+        action_space: gym.spaces.Space,
+        lr_schedule: Schedule,
+        backbone_args: Dict[str, Any],
+        ortho_init: bool = True,
+        use_sde: bool = False,
+        log_std_init: float = 0.0,
+        full_std: bool = True,
+        sde_net_arch: Optional[List[int]] = None,
+        use_expln: bool = False,
+        squash_output: bool = None,
+        features_extractor_class: Type[BaseFeaturesExtractor] = FlattenExtractor,
+        features_extractor_kwargs: Optional[Dict[str, Any]] = None,
+        normalize_images: bool = None,
+        optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
+        optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        action_scale: float = 1
+    ):
+
+        if optimizer_kwargs is None:
+            optimizer_kwargs = {}
+            # Small values to avoid NaN in Adam optimizer
+            if optimizer_class == th.optim.Adam:
+                optimizer_kwargs["eps"] = 1e-5
+
+        super(ActorCriticGNNPolicy, self).__init__(
+            observation_space,
+            action_space,
+            features_extractor_class,
+            features_extractor_kwargs,
+            optimizer_class=optimizer_class,
+            optimizer_kwargs=optimizer_kwargs,
+            squash_output=squash_output,
+            normalize_images=normalize_images
+        )
+
+        self.backbone_args = backbone_args
+        self.log_std_init = log_std_init
+        self.ortho_init = ortho_init
+        self.action_scale = action_scale
+
+        schnet = spk.SchNet(
+            n_interactions=self.backbone_args["n_interactions"],
+            cutoff=self.backbone_args["cutoff"],
+            n_gaussians=self.backbone_args["n_gaussians"]
+        )
+
+        output_modules = [
+            spk.atomistic.Atomwise(
+                n_in=schnet.n_atom_basis,
+                n_out=features_extractor_kwargs['out_embedding_size'],
+                n_neurons=[features_extractor_kwargs['out_embedding_size']],
+                contributions='embedding'
+            )
+        ]
+
+        self.features_extractor = spk.atomistic.model.AtomisticModel(schnet, output_modules)
+        self.features_dim = features_extractor_kwargs['out_embedding_size']
+
+        dist_kwargs = {"squash_output": squash_output}
+        # Keyword arguments for gSDE distribution
+        if use_sde:
+            dist_kwargs = {
+                "full_std": full_std,
+                "squash_output": squash_output,
+                "use_expln": use_expln,
+                "learn_features": False,
+            }
+
+        if sde_net_arch is not None:
+            warnings.warn("sde_net_arch is deprecated and will be removed in SB3 v2.4.0.", DeprecationWarning)
+
+        self.use_sde = use_sde
+        self.dist_kwargs = dist_kwargs
+
+        # Action distribution
+        self.action_dist = make_proba_distribution(action_space, use_sde=use_sde, dist_kwargs=dist_kwargs)
+
+        self._build(lr_schedule)
+
+    def extract_features(self, obs: Dict[str, th.Tensor]) -> Dict[str, th.Tensor]:
+        """
+        Preprocess the observation if needed and extract features.
+
+        :param obs:
+        :return:
+        """
+        return self.features_extractor(obs)
+
+    def _get_constructor_parameters(self) -> Dict[str, Any]:
+        data = super()._get_constructor_parameters()
+
+        default_none_kwargs = self.dist_kwargs or collections.defaultdict(lambda: None)
+
+        data.update(
+            dict(
+                backbone_args=self.backbone_args,
+                use_sde=self.use_sde,
+                log_std_init=self.log_std_init,
+                squash_output=default_none_kwargs["squash_output"],
+                full_std=default_none_kwargs["full_std"],
+                use_expln=default_none_kwargs["use_expln"],
+                lr_schedule=self._dummy_schedule,  # dummy lr schedule, not needed for loading policy alone
+                ortho_init=self.ortho_init,
+                optimizer_class=self.optimizer_class,
+                optimizer_kwargs=self.optimizer_kwargs,
+                features_extractor_class=self.features_extractor_class,
+                features_extractor_kwargs=self.features_extractor_kwargs,
+            )
+        )
+        return data
+
+    def reset_noise(self, n_envs: int = 1) -> None:
+        """
+        Sample new weights for the exploration matrix.
+
+        :param n_envs:
+        """
+        assert isinstance(self.action_dist, StateDependentNoiseDistribution), "reset_noise() is only available when using gSDE"
+        self.action_dist.sample_weights(self.log_std, batch_size=n_envs)
+
+    def _build(self, lr_schedule: Schedule) -> None:
+        """
+        Create the networks and the optimizer.
+
+        :param lr_schedule: Learning rate schedule
+            lr_schedule(1) is the initial learning rate
+        """
+
+        latent_dim_pi = self.features_dim
+
+        if isinstance(self.action_dist, DiagGaussianDistribution):
+            self.action_net, self.log_std = self.action_dist.proba_distribution_net(
+                latent_dim=latent_dim_pi, log_std_init=self.log_std_init
+            )
+        elif isinstance(self.action_dist, StateDependentNoiseDistribution):
+            self.action_net, self.log_std = self.action_dist.proba_distribution_net(
+                latent_dim=latent_dim_pi, latent_sde_dim=latent_dim_pi, log_std_init=self.log_std_init
+            )
+        else:
+            raise NotImplementedError(f"Unsupported distribution '{self.action_dist}'.")
+
+        self.value_net = nn.Linear(self.features_dim, 1)
+        # Init weights: use orthogonal initialization
+        # with small initial weight for the output
+        if self.ortho_init:
+            # TODO: check for features_extractor
+            # Values from stable-baselines.
+            # features_extractor/mlp values are
+            # originally from openai/baselines (default gains/init_scales).
+            module_gains = {
+                self.action_net: 0.01,
+                self.value_net: 1,
+            }
+            for module, gain in module_gains.items():
+                module.apply(partial(self.init_weights, gain=gain))
+
+        # Setup optimizer with initial learning rate
+        self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
+
+    def forward(self, obs: Dict[str, th.Tensor], deterministic: bool = False) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """
+        Forward pass in all the networks (actor and critic)
+
+        :param obs: Observation
+        :param deterministic: Whether to sample or use deterministic actions
+        :return: action, value and log probability of the action
+        """
+        # Preprocess the observation if needed
+        atoms_mask = obs['_atom_mask']
+        features = self.extract_features(obs)
+        latent_pi, latent_vf = features['embedding'], features['y']
+        # Evaluate the values for the given observations
+        values = self.value_net(latent_vf)
+        latent_pi = latent_pi.reshape(-1, self.features_dim)
+        distribution = self._get_action_dist_from_latent(latent_pi)
+        actions = distribution.get_actions(deterministic=deterministic)
+        log_prob = distribution.log_prob(actions)
+        return self.action_scale * actions.reshape((*atoms_mask.size(), actions.size()[-1])) * atoms_mask.unsqueeze(-1),\
+               values,\
+               th.sum(log_prob.reshape(atoms_mask.size()) * atoms_mask, dim=-1)
+
+    def _get_action_dist_from_latent(self, latent_pi: th.Tensor) -> Distribution:
+        """
+        Retrieve action distribution given the latent codes.
+
+        :param latent_pi: Latent code for the actor
+        :return: Action distribution
+        """
+        mean_actions = self.action_net(latent_pi)
+
+        if isinstance(self.action_dist, DiagGaussianDistribution):
+            return self.action_dist.proba_distribution(mean_actions, self.log_std)
+        elif isinstance(self.action_dist, StateDependentNoiseDistribution):
+            return self.action_dist.proba_distribution(mean_actions, self.log_std, latent_pi)
+        else:
+            raise ValueError("Invalid action distribution")
+
+    def _predict(self, observation: Dict[str, th.Tensor], deterministic: bool = False) -> th.Tensor:
+        """
+        Get the action according to the policy for a given observation.
+
+        :param observation:
+        :param deterministic: Whether to use stochastic or deterministic actions
+        :return: Taken action according to the policy
+        """
+        atoms_mask = observation['_atom_mask']
+        actions = self.get_distribution(observation).get_actions(deterministic=deterministic)
+        return self.action_scale * actions.reshape((*atoms_mask.size(), actions.size()[-1])) * atoms_mask.unsqueeze(-1)
+
+    def predict(
+        self,
+        observation: Dict[str, th.Tensor],
+        state: Optional[Tuple[np.ndarray, ...]] = None,
+        episode_start: Optional[np.ndarray] = None,
+        deterministic: bool = False,
+    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
+        """
+        Get the policy action from an observation (and optional hidden state).
+        Includes sugar-coating to handle different observations (e.g. normalizing images).
+
+        :param observation: the input observation
+        :param state: The last hidden states (can be None, used in recurrent policies)
+        :param episode_start: The last masks (can be None, used in recurrent policies)
+            this correspond to beginning of episodes,
+            where the hidden states of the RNN must be reset.
+        :param deterministic: Whether or not to return deterministic actions.
+        :return: the model's action and the next hidden state
+            (used in recurrent policies)
+        """
+        # TODO (GH/1): add support for RNN policies
+        # if state is None:
+        #     state = self.initial_state
+        # if episode_start is None:
+        #     episode_start = [False for _ in range(self.n_envs)]
+        # Switch to eval mode (this affects batch norm / dropout)
+        self.set_training_mode(False)
+
+        with th.no_grad():
+            actions = self._predict(observation, deterministic=deterministic)
+        # Convert to numpy
+        actions = actions.cpu().numpy()
+
+        return actions, state
+
+    def evaluate_actions(self, obs: Dict[str, th.Tensor], actions: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """
+        Evaluate actions according to the current policy,
+        given the observations.
+
+        :param obs:
+        :param actions:
+        :return: estimated value, log likelihood of taking those actions
+            and entropy of the action distribution.
+        """
+        # Preprocess the observation if needed
+        atoms_mask = obs['_atom_mask']
+        features = self.extract_features(obs)
+        latent_pi, latent_vf = features['embedding'], features['y']
+        latent_pi = latent_pi.reshape(-1, self.features_dim)
+        distribution = self._get_action_dist_from_latent(latent_pi)
+        log_prob = distribution.log_prob(actions.reshape(-1, actions.size()[-1]) / self.action_scale)
+        values = self.value_net(latent_vf)
+        if self.squash_output:
+            entropy = None
+        else:
+            entropy = th.sum(distribution.entropy().reshape(atoms_mask.size()) * atoms_mask, dim=-1)
+        return values, th.sum(log_prob.reshape(atoms_mask.size()) * atoms_mask, dim=-1), entropy
+
+    def get_distribution(self, obs: Dict[str, th.Tensor]) -> Distribution:
+        """
+        Get the current policy distribution given the observations.
+
+        :param obs:
+        :return: the action distribution.
+        """
+        features = self.extract_features(obs)
+        latent_pi = features['embedding'].reshape(-1, self.features_dim)
+        return self._get_action_dist_from_latent(latent_pi)
+
+    def predict_values(self, obs: Dict[str, th.Tensor]) -> th.Tensor:
+        """
+        Get the estimated values according to the current policy given the observations.
+
+        :param obs:
+        :return: the estimated values.
+        """
+        features = self.extract_features(obs)
+        latent_vf = features['y']
+        return self.value_net(latent_vf)
 
 
 class ContinuousCritic(BaseModel):

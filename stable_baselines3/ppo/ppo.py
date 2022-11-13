@@ -6,6 +6,7 @@ import torch as th
 from gym import spaces
 from torch.nn import functional as F
 
+from stable_baselines3.common.buffers import RolloutBuffer
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
@@ -91,6 +92,7 @@ class PPO(OnPolicyAlgorithm):
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
+        buffer_cls: Type[RolloutBuffer] = None,
     ):
 
         super(PPO, self).__init__(
@@ -118,6 +120,7 @@ class PPO(OnPolicyAlgorithm):
                 spaces.MultiDiscrete,
                 spaces.MultiBinary,
             ),
+            buffer_cls=buffer_cls
         )
 
         # Sanity check, otherwise it will lead to noisy gradient and NaN
@@ -183,6 +186,7 @@ class PPO(OnPolicyAlgorithm):
         entropy_losses = []
         pg_losses, value_losses = [], []
         clip_fractions = []
+        grad_norms = []
 
         continue_training = True
 
@@ -263,7 +267,8 @@ class PPO(OnPolicyAlgorithm):
                 self.policy.optimizer.zero_grad()
                 loss.backward()
                 # Clip grad norm
-                th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                grad_norm = th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm).item()
+                grad_norms.append(grad_norm)
                 self.policy.optimizer.step()
 
             if not continue_training:
@@ -273,13 +278,14 @@ class PPO(OnPolicyAlgorithm):
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
         # Logs
-        self.logger.record("train/entropy_loss", np.mean(entropy_losses))
+        self.logger.record("train/entropy_loss_weighted", self.ent_coef * np.mean(entropy_losses))
         self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
-        self.logger.record("train/value_loss", np.mean(value_losses))
+        self.logger.record("train/value_loss_weighted", self.vf_coef * np.mean(value_losses))
         self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
         self.logger.record("train/clip_fraction", np.mean(clip_fractions))
         self.logger.record("train/loss", loss.item())
         self.logger.record("train/explained_variance", explained_var)
+        self.logger.record("train/grad_norm", np.mean(grad_norms))
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
 

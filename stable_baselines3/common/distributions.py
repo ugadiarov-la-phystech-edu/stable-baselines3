@@ -211,6 +211,7 @@ class SquashedDiagGaussianDistribution(DiagGaussianDistribution):
         return self
 
     def log_prob(self, actions: th.Tensor, gaussian_actions: Optional[th.Tensor] = None) -> th.Tensor:
+        actions = th.clamp(actions, min=-1., max=1.)
         # Inverse tanh
         # Naive implementation (not stable): 0.5 * torch.log((1 + x) / (1 - x))
         # We use numpy to avoid numerical instability
@@ -658,8 +659,12 @@ def make_proba_distribution(
 
     if isinstance(action_space, spaces.Box):
         assert len(action_space.shape) == 1, "Error: the action space must be a vector"
-        cls = StateDependentNoiseDistribution if use_sde else DiagGaussianDistribution
-        return cls(get_action_dim(action_space), **dist_kwargs)
+        if use_sde:
+            return StateDependentNoiseDistribution(get_action_dim(action_space), **dist_kwargs)
+        elif 'squash_output' in dist_kwargs and dist_kwargs['squash_output']:
+            return SquashedDiagGaussianDistribution(get_action_dim(action_space))
+        else:
+            return DiagGaussianDistribution(get_action_dim(action_space))
     elif isinstance(action_space, spaces.Discrete):
         return CategoricalDistribution(action_space.n, **dist_kwargs)
     elif isinstance(action_space, spaces.MultiDiscrete):

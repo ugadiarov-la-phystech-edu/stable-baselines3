@@ -3,8 +3,10 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, Generator, List, Optional, Union
 
 import numpy as np
+import torch
 import torch as th
 from gym import spaces
+from schnetpack.data.loader import _collate_aseatoms
 
 from stable_baselines3.common.preprocessing import get_action_dim, get_obs_shape
 from stable_baselines3.common.type_aliases import (
@@ -767,3 +769,146 @@ class DictRolloutBuffer(RolloutBuffer):
             advantages=self.to_torch(self.advantages[batch_inds].flatten()),
             returns=self.to_torch(self.returns[batch_inds].flatten()),
         )
+
+
+class SchNetRolloutBuffer(RolloutBuffer):
+    """
+    Dict Rollout buffer used in on-policy algorithms like A2C/PPO.
+    Extends the RolloutBuffer to use dictionary observations
+
+    It corresponds to ``buffer_size`` transitions collected
+    using the current policy.
+    This experience will be discarded after the policy update.
+    In order to use PPO objective, we also store the current value of each state
+    and the log probability of each taken action.
+
+    The term rollout here refers to the model-free notion and should not
+    be used with the concept of rollout used in model-based RL or planning.
+    Hence, it is only involved in policy and value function training but not action selection.
+
+    :param buffer_size: Max number of element in the buffer
+    :param observation_space: Observation space
+    :param action_space: Action space
+    :param device:
+    :param gae_lambda: Factor for trade-off of bias vs variance for Generalized Advantage Estimator
+        Equivalent to Monte-Carlo advantage estimate when set to 1.
+    :param gamma: Discount factor
+    :param n_envs: Number of parallel environments
+    """
+
+    def __init__(
+        self,
+        buffer_size: int,
+        observation_space: spaces.Space,
+        action_space: spaces.Space,
+        device: Union[th.device, str] = "cpu",
+        gae_lambda: float = 1,
+        gamma: float = 0.99,
+        n_envs: int = 1,
+    ):
+
+        super(RolloutBuffer, self).__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
+
+        assert isinstance(self.obs_shape, dict), "DictRolloutBuffer must be used with Dict obs space only"
+
+        self.gae_lambda = gae_lambda
+        self.gamma = gamma
+        self.observations, self.actions, self.rewards, self.advantages = None, None, None, None
+        self.returns, self.episode_starts, self.values, self.log_probs = None, None, None, None
+        self.generator_ready = False
+        self.reset()
+
+    def reset(self) -> None:
+        assert isinstance(self.obs_shape, dict), "DictRolloutBuffer must be used with Dict obs space only"
+        self.observations = [None] * self.buffer_size
+        self.actions = [None] * self.buffer_size
+        self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.returns = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.episode_starts = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.values = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.log_probs = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.advantages = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.generator_ready = False
+        super(RolloutBuffer, self).reset()
+
+    def add(
+        self,
+        obs: Dict[str, th.Tensor],
+        action: np.ndarray,
+        reward: np.ndarray,
+        episode_start: np.ndarray,
+        value: th.Tensor,
+        log_prob: th.Tensor,
+    ) -> None:
+        """
+        :param obs: Observation
+        :param action: Action
+        :param reward:
+        :param episode_start: Start of episode signal.
+        :param value: estimated value of the current state
+            following the current policy.
+        :param log_prob: log probability of the action
+            following the current policy.
+        """
+        assert obs['_atom_mask'].size()[0] == self.n_envs
+        assert action.shape[0] == self.n_envs
+
+        if len(log_prob.shape) == 0:
+            # Reshape 0-d tensor to avoid error
+            log_prob = log_prob.reshape(-1, 1)
+
+        num_atoms = obs['_atom_mask'].sum(-1).long()
+        self.observations[self.pos] = [{key: value[i, :num_atoms[i]].cpu() for key, value in obs.items()
+                                        if key != 'representation'} for i in range(self.n_envs)]
+        self.actions[self.pos] = [torch.tensor(act[:n], device='cpu') for act, n in zip(action, num_atoms)]
+        self.rewards[self.pos] = np.array(reward).copy()
+        self.episode_starts[self.pos] = np.array(episode_start).copy()
+        self.values[self.pos] = value.clone().cpu().numpy().flatten()
+        self.log_probs[self.pos] = log_prob.clone().cpu().numpy()
+        self.pos += 1
+        if self.pos == self.buffer_size:
+            self.full = True
+
+    def get(self, batch_size: Optional[int] = None) -> Generator[DictRolloutBufferSamples, None, None]:
+        assert self.full, ""
+        indices = np.random.permutation(self.buffer_size * self.n_envs)
+        # Prepare the data
+        if not self.generator_ready:
+            self.observations = [observation for observations in self.observations for observation in observations]
+            self.actions = [action for actions in self.actions for action in actions]
+
+            _tensor_names = ["values", "log_probs", "advantages", "returns"]
+
+            for tensor in _tensor_names:
+                self.__dict__[tensor] = self.swap_and_flatten(self.__dict__[tensor])
+            self.generator_ready = True
+
+        # Return everything, don't create minibatches
+        if batch_size is None:
+            batch_size = self.buffer_size * self.n_envs
+
+        start_idx = 0
+        while start_idx < self.buffer_size * self.n_envs:
+            batch_inds = indices[start_idx:start_idx + batch_size]
+            observations = [self.observations[i] for i in batch_inds]
+            observations_batch = {key: value.to(self.device) for key, value in _collate_aseatoms(observations).items()}
+
+            actions = [self.actions[i] for i in batch_inds]
+            actions_batch = self._collate_actions(actions).to(self.device)
+
+            yield DictRolloutBufferSamples(
+                observations=observations_batch,
+                actions=actions_batch,
+                old_values=self.to_torch(self.values[batch_inds].flatten()),
+                old_log_prob=self.to_torch(self.log_probs[batch_inds].flatten()),
+                advantages=self.to_torch(self.advantages[batch_inds].flatten()),
+                returns=self.to_torch(self.returns[batch_inds].flatten()),
+            )
+            start_idx += batch_size
+
+    def _collate_actions(self, actions):
+        max_size = max([action.size()[0] for action in actions])
+        actions_batch = torch.zeros(len(actions), max_size, actions[0].shape[1], dtype=actions[0].dtype)
+        for i, action in enumerate(actions):
+            actions_batch[i, :action.size()[0]] = action
+        return actions_batch
