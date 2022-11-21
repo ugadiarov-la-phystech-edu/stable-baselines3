@@ -248,7 +248,7 @@ class PPO(OnPolicyAlgorithm):
                 if self.use_sde:
                     self.policy.reset_noise(self.batch_size)
 
-                evaluation_result = self.policy.evaluate_actions(rollout_data.observations, actions)
+                evaluation_result = self.policy.evaluate_actions(rollout_data.observations, actions, self.predict_transition)
                 if len(evaluation_result) == 3:
                     values, log_prob, entropy = evaluation_result
                     state_embedding = transition = None
