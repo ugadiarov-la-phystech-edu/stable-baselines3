@@ -88,11 +88,12 @@ class Push(gym.Env):
     BOX = 'box'
 
     def __init__(self, mode='default', n_boxes=5, n_static_boxes=0, n_goals=1, static_goals=True, width=10,
-                 return_state=True,
-                 observation_type='squares', max_episode_steps=75, hard_walls=False, channels_first=True, seed=None):
+                 embodied_agent=False, return_state=True, observation_type='squares', max_episode_steps=75,
+                 hard_walls=False, channels_first=True, seed=None):
         self.w = width
         self.step_limit = max_episode_steps
         self.n_boxes = n_boxes
+        self.embodied_agent = embodied_agent
 
         self.goal_ids = set()
         self.static_box_ids = set()
@@ -107,8 +108,10 @@ class Push(gym.Env):
 
         assert len(self.goal_ids) == n_goals
         assert len(self.static_box_ids) == n_static_boxes
+        if self.embodied_agent:
+            assert self.n_boxes > len(self.goal_ids) + len(self.static_box_ids)
 
-        self.n_boxes_in_game = self.n_boxes - len(self.goal_ids) - len(self.static_box_ids)
+        self.n_boxes_in_game = self.n_boxes - len(self.goal_ids) - len(self.static_box_ids) - self.embodied_agent
         self.static_goals = static_goals
         self.render_scale = 5
         self.hard_walls = hard_walls
@@ -126,15 +129,21 @@ class Push(gym.Env):
 
         self.np_random = None
 
-        self.action_space = spaces.Discrete(
-            4 * (self.n_boxes - len(self.goal_ids) * self.static_goals) - len(self.static_box_ids))
+        if self.embodied_agent:
+            self.action_space = spaces.Discrete(4)
+        else:
+            self.action_space = spaces.Discrete(
+                4 * (self.n_boxes - len(self.goal_ids) * self.static_goals - len(self.static_box_ids))
+            )
+
         if self.observation_type == 'grid':
+            raise NotImplementedError(f'Observation type "{observation_type}" has not been implemented yet')
+            # channels are movable boxes, goals, static boxes
             self.observation_space = spaces.Box(
                 0,
                 1,
                 (self.w, self.w, self.n_boxes)
             )
-            # channels are movable boxes, goals, static boxes
         elif self.observation_type in ('squares', 'shapes'):
             observation_shape = (self.w * self.render_scale, self.w * self.render_scale, 3)
             if self.channels_first:
@@ -232,8 +241,12 @@ class Push(gym.Env):
         elif not self.is_in_grid(box_new_pos):
             reward += -0.1
             if not self.hard_walls:
-                # push out of grid, destroy
-                self._destroy_box(box_id)
+                # push out of grid, destroy box or finish episode if an agent is out of the grid
+                if self.embodied_agent:
+                    reward -= 1
+                    done = True
+                else:
+                    self._destroy_box(box_id)
         elif not self._is_free_cell(box_new_pos):
             # push into another box
             another_box_id = self._get_occupied_box_id(box_new_pos)
@@ -258,8 +271,29 @@ class Push(gym.Env):
                             self._destroy_box(another_box_id)
                             self._move(box_id, box_new_pos)
                 elif another_box_type == self.GOAL:
-                    reward += 1
-                    self._destroy_box(box_id)
+                    if self.embodied_agent:
+                        another_box_new_pos = box_new_pos + vec
+                        if self.is_in_grid(another_box_new_pos):
+                            if self._is_free_cell(another_box_new_pos):
+                                self._move(another_box_id, another_box_new_pos)
+                                self._move(box_id, box_new_pos)
+                            elif self._get_type(self._get_occupied_box_id(another_box_new_pos)) == self.GOAL:
+                                reward += -0.1
+                            else:
+                                assert self._get_type(self._get_occupied_box_id(another_box_new_pos)) in (self.BOX, self.STATIC_BOX)
+                                reward += 1
+                                self._destroy_box(self._get_occupied_box_id(another_box_new_pos))
+                                self._move(another_box_id, another_box_new_pos)
+                                self._move(box_id, box_new_pos)
+                        else:
+                            reward += -0.1
+                            if not self.hard_walls:
+                                reward -= 1
+                                self._destroy_box(another_box_id)
+                                self._move(box_id, box_new_pos)
+                    else:
+                        reward += 1
+                        self._destroy_box(box_id)
                 else:
                     assert box_type == self.STATIC_BOX
                     reward += -0.1
@@ -382,7 +416,7 @@ if __name__ == "__main__":
     If called without arguments, starts an interactive game played with wasd to move, q to quit.
     """
     env = Push(n_boxes=5, n_static_boxes=0, n_goals=1, static_goals=True, observation_type='shapes', hard_walls=True,
-               channels_first=False, width=5)
+               channels_first=False, width=5, embodied_agent=True)
 
     if len(sys.argv) > 1 and sys.argv[1] == "random":
         all_r = []
