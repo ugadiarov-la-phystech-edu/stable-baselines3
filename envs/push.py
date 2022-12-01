@@ -32,21 +32,26 @@ def square(r0, c0, width, im_size):
 
 
 def triangle(r0, c0, width, im_size):
-    rr = np.asarray([r0 + 4] * 5 + [r0 + 3] * 3 + [r0 + 2] * 3 + [r0 + 1] + [r0], dtype=np.int32)
-    cc = np.asarray(list(range(c0, c0 + 5)) + list(range(c0 + 1, c0 + 4)) * 2 + [c0 + 2] * 2, dtype=np.int32)
-    # rr, cc = [r0, r0 + width - 1, r0 + width - 1], [c0 + width // 2, c0, c0 + width - 1]
-    # return skimage.draw.polygon(rr, cc, im_size)
-    return rr, cc
+    if width == 5:
+        rr = np.asarray([r0 + 4] * 5 + [r0 + 3] * 3 + [r0 + 2] * 3 + [r0 + 1] + [r0], dtype=np.int32)
+        cc = np.asarray(list(range(c0, c0 + 5)) + list(range(c0 + 1, c0 + 4)) * 2 + [c0 + 2] * 2, dtype=np.int32)
+        return rr, cc
+
+    rr, cc = [r0, r0 + width - 1, r0 + width - 1], [c0 + width // 2, c0, c0 + width - 1]
+    return skimage.draw.polygon(rr, cc, im_size)
 
 
 def circle(r0, c0, width, im_size):
-    rr = np.asarray([r0] + [r0 + 1] * 3 + [r0 + 2] * 5 + [r0 + 3] * 3 + [r0 + 4], dtype=np.int32)
-    cc = np.asarray(
-        [c0 + 2] + list(range(c0 + 1, c0 + 4)) + list(range(c0, c0 + 5)) + list(range(c0 + 1, c0 + 4)) + [c0 + 2],
-        dtype=np.int32)
-    # rr, cc = [r0, r0 + width - 1, r0 + width - 1], [c0 + width // 2, c0, c0 + width - 1]
-    # return skimage.draw.polygon(rr, cc, im_size)
-    return rr, cc
+    if width == 5:
+        rr = np.asarray([r0] + [r0 + 1] * 3 + [r0 + 2] * 5 + [r0 + 3] * 3 + [r0 + 4], dtype=np.int32)
+        cc = np.asarray(
+            [c0 + 2] + list(range(c0 + 1, c0 + 4)) + list(range(c0, c0 + 5)) + list(range(c0 + 1, c0 + 4)) + [c0 + 2],
+            dtype=np.int32)
+        return rr, cc
+
+    radius = width // 2
+    return skimage.draw.ellipse(
+        r0 + radius, c0 + radius, radius, radius)
 
 
 def cross(r0, c0, width, im_size):
@@ -68,13 +73,15 @@ def pentagon(r0, c0, width, im_size):
 
 
 def parallelogram(r0, c0, width, im_size):
-    rr = np.asarray([r0] * 2 + [r0 + 1] * 3 + [r0 + 2] * 3 + [r0 + 3] * 3 + [r0 + 4] * 2, dtype=np.int32)
-    cc = np.asarray(
-        [c0, c0 + 1] + list(range(c0, c0 + 3)) + list(range(c0 + 1, c0 + 4)) + list(range(c0 + 2, c0 + 5)) + list(
-            range(c0 + 3, c0 + 5)), dtype=np.int32)
-    # rr, cc = [r0, r0 + width, r0 + width, r0], [c0, c0 + width // 2, c0 + width, c0 + width - width // 2]
-    # return skimage.draw.polygon(rr, cc, im_size)
-    return rr, cc
+    if width == 5:
+        rr = np.asarray([r0] * 2 + [r0 + 1] * 3 + [r0 + 2] * 3 + [r0 + 3] * 3 + [r0 + 4] * 2, dtype=np.int32)
+        cc = np.asarray(
+            [c0, c0 + 1] + list(range(c0, c0 + 3)) + list(range(c0 + 1, c0 + 4)) + list(range(c0 + 2, c0 + 5)) + list(
+                range(c0 + 3, c0 + 5)), dtype=np.int32)
+        return rr, cc
+
+    rr, cc = [r0, r0 + width, r0 + width, r0], [c0, c0 + width // 2, c0 + width, c0 + width - width // 2]
+    return skimage.draw.polygon(rr, cc, im_size)
 
 
 def scalene_triangle(r0, c0, width, im_size):
@@ -89,7 +96,7 @@ class Push(gym.Env):
 
     def __init__(self, mode='default', n_boxes=5, n_static_boxes=0, n_goals=1, static_goals=True, width=10,
                  embodied_agent=False, return_state=True, observation_type='squares', max_episode_steps=75,
-                 hard_walls=False, channels_first=True, seed=None):
+                 hard_walls=False, channels_first=True, seed=None, render_scale=5):
         self.w = width
         self.step_limit = max_episode_steps
         self.n_boxes = n_boxes
@@ -113,7 +120,7 @@ class Push(gym.Env):
 
         self.n_boxes_in_game = self.n_boxes - len(self.goal_ids) - len(self.static_box_ids) - self.embodied_agent
         self.static_goals = static_goals
-        self.render_scale = 5
+        self.render_scale = render_scale
         self.hard_walls = hard_walls
         self.colors = get_colors(num_colors=max(9, self.n_boxes))
         self.observation_type = observation_type
@@ -375,9 +382,6 @@ class Push(gym.Env):
 
             shape_id = idx % 8
             if shape_id == 0:
-                # radius = self.render_scale // 2
-                # rr, cc = skimage.draw.circle(
-                #     pos[0] * self.render_scale + radius, pos[1] * self.render_scale + radius, radius, im.shape)
                 rr, cc = circle(pos[0] * self.render_scale, pos[1] * self.render_scale, self.render_scale, im.shape)
             elif shape_id == 1:
                 rr, cc = triangle(
@@ -416,7 +420,7 @@ if __name__ == "__main__":
     If called without arguments, starts an interactive game played with wasd to move, q to quit.
     """
     env = Push(n_boxes=5, n_static_boxes=0, n_goals=1, static_goals=True, observation_type='shapes', hard_walls=True,
-               channels_first=False, width=5, embodied_agent=True)
+               channels_first=False, width=5, embodied_agent=True, render_scale=10)
 
     if len(sys.argv) > 1 and sys.argv[1] == "random":
         all_r = []
