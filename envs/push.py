@@ -118,7 +118,7 @@ class Push(gym.Env):
         if self.embodied_agent:
             assert self.n_boxes > len(self.goal_ids) + len(self.static_box_ids)
 
-        self.n_boxes_in_game = self.n_boxes - len(self.goal_ids) - len(self.static_box_ids) - self.embodied_agent
+        self.n_boxes_in_game = None
         self.static_goals = static_goals
         self.render_scale = render_scale
         self.hard_walls = hard_walls
@@ -160,7 +160,7 @@ class Push(gym.Env):
             raise ValueError(f'Invalid observation_type: {self.observation_type}.')
 
         self.state = None
-        self.steps_taken = 0
+        self.steps_taken = None
         self.pos = None
         self.image = None
         self.box_pos = np.zeros(shape=(self.n_boxes, 2), dtype=np.int32)
@@ -200,6 +200,7 @@ class Push(gym.Env):
 
         self.state = state
         self.steps_taken = 0
+        self.n_boxes_in_game = self.n_boxes - len(self.goal_ids) - len(self.static_box_ids) - self.embodied_agent
 
         return self._get_observation()
 
@@ -419,8 +420,8 @@ if __name__ == "__main__":
     If called directly with argument "random", evaluates the average return of a random policy.
     If called without arguments, starts an interactive game played with wasd to move, q to quit.
     """
-    env = Push(n_boxes=5, n_static_boxes=0, n_goals=1, static_goals=True, observation_type='shapes', hard_walls=True,
-               channels_first=False, width=5, embodied_agent=True, render_scale=10)
+    env = Push(channels_first=False, hard_walls=True, max_episode_steps=30, n_boxes=5, n_goals=1, n_static_boxes=0,
+               observation_type='shapes', render_scale=10, return_state=False, static_goals=True, width=5)
 
     if len(sys.argv) > 1 and sys.argv[1] == "random":
         all_r = []
@@ -440,7 +441,7 @@ if __name__ == "__main__":
         print(np.mean(all_r), np.std(all_r), np.std(all_r) / np.sqrt(n_episodes))
     else:
         s = env.reset()
-        plt.imshow(s[1])
+        plt.imshow(s)
         plt.show()
         env.print()
         episode_r = 0
@@ -468,8 +469,8 @@ if __name__ == "__main__":
 
             s, r, d, _ = env.step(a)
             episode_r += r
-            env.print(f'. Reward: {episode_r}')
-            plt.imshow(s[1])
+            env.print(f'. Reward: {episode_r}.')
+            plt.imshow(s)
             plt.show()
             if d or key == "r":
                 print("Done with {} points. Resetting!".format(episode_r))
