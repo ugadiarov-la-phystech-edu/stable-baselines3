@@ -187,7 +187,7 @@ class EncoderMLP(nn.Module):
         h_flat = ins.view(-1, self.num_objects, self.input_dim)
         h = self.act1(self.fc1(h_flat))
         h = self.act2(self.ln(self.fc2(h)))
-        return self.fc3(h).view(-1, self.num_objects * self.output_dim)
+        return self.fc3(h)
 
 
 class CSWMCNN(BaseFeaturesExtractor):
@@ -201,8 +201,8 @@ class CSWMCNN(BaseFeaturesExtractor):
         num_objects: Number of object slots.
     """
 
-    def __init__(self, observation_space: gym.spaces.Box, embedding_dim, hidden_dim,
-                 num_objects, encoder='large'):
+    def __init__(self, observation_space: gym.spaces.Box, embedding_dim, hidden_dim, num_objects, freeze=False,
+                 encoder='large', obj_extractor_path=None, obj_encoder_path=None, concatenate_object_embeddings=False):
         super(CSWMCNN, self).__init__(observation_space, num_objects * embedding_dim)
         # We assume CxHxW images (channels first)
         # Re-ordering will be done by pre-preprocessing or wrapper
@@ -215,9 +215,11 @@ class CSWMCNN(BaseFeaturesExtractor):
             "https://stable-baselines3.readthedocs.io/en/master/common/env_checker.html"
         )
 
+        self.concatenate_object_embeddings = concatenate_object_embeddings
         self.hidden_dim = hidden_dim
         self.embedding_dim = embedding_dim
         self.num_objects = num_objects
+        self.freeze = freeze
 
         num_channels = observation_space.shape[0]
         width_height = observation_space.shape[1:]
@@ -250,11 +252,26 @@ class CSWMCNN(BaseFeaturesExtractor):
             output_dim=embedding_dim,
             num_objects=num_objects)
 
+        if obj_extractor_path is not None:
+            self.obj_extractor.load_state_dict(th.load(obj_extractor_path))
+
+        if obj_encoder_path is not None:
+            self.obj_encoder.load_state_dict(th.load(obj_encoder_path))
+
+        for module in self.obj_extractor, self.obj_encoder:
+            for param in module.parameters():
+                param.requires_grad = not self.freeze
+
         self.width = width_height[0]
         self.height = width_height[1]
 
     def forward(self, obs):
-        return self.obj_encoder(self.obj_extractor(obs))
+        embeddings = self.obj_encoder(self.obj_extractor(obs))
+        if self.concatenate_object_embeddings:
+            batch_size = embeddings.size()[0]
+            return embeddings.view(batch_size, self.num_objects * self.embedding_dim)
+
+        return embeddings
 
 
 class CSWMCNNObjectWise(BaseFeaturesExtractor):
