@@ -784,15 +784,13 @@ class ActorCriticCSWMPolicy(BasePolicy):
         lr_schedule: Schedule,
         action_net_head_type: str = 'mean',
         value_net_head_type: str = 'sum',
+        use_transition_net: bool = False,
         use_sde: bool = False,
         log_std_init: float = 0.0,
         full_std: bool = True,
         sde_net_arch: Optional[List[int]] = None,
         use_expln: bool = False,
         squash_output: bool = False,
-        embedding_dim: int = 128,
-        hidden_dim: int = 512,
-        num_objects: int = 6,
         features_extractor_class: Type[CSWMCNN] = CSWMCNN,
         features_extractor_kwargs: Optional[Dict[str, Any]] = None,
         normalize_images: bool = True,
@@ -816,15 +814,15 @@ class ActorCriticCSWMPolicy(BasePolicy):
             squash_output=squash_output,
         )
 
-        self.embedding_dim = embedding_dim
-        self.hidden_dim = hidden_dim
-        self.num_objects = num_objects
+        self.embedding_dim = self.features_extractor_kwargs['embedding_dim']
+        self.hidden_dim = self.features_extractor_kwargs['hidden_dim']
+        self.num_objects = self.features_extractor_kwargs['num_objects']
         self.action_net_head_type = action_net_head_type
         self.value_net_head_type = value_net_head_type
+        self.use_transition_net = use_transition_net
 
         self.features_extractor = features_extractor_class(
-            self.observation_space, self.embedding_dim, self.hidden_dim,
-            **self.features_extractor_kwargs
+            self.observation_space, **self.features_extractor_kwargs
         )
         self.features_dim = self.features_extractor.features_dim
 
@@ -857,8 +855,6 @@ class ActorCriticCSWMPolicy(BasePolicy):
         default_none_kwargs = self.dist_kwargs or collections.defaultdict(lambda: None)
         data.update(
             dict(
-                embedding_dim=self.embedding_dim,
-                hidden_dim=self.hidden_dim,
                 num_objects=self.num_objects,
                 action_net_head=self.action_net_head_type,
                 value_net_head=self.value_net_head_type,
@@ -892,10 +888,11 @@ class ActorCriticCSWMPolicy(BasePolicy):
         :param lr_schedule: Learning rate schedule
             lr_schedule(1) is the initial learning rate
         """
-        self.transition_net = TransitionGNN(
-            input_dim=self.embedding_dim, output_dim=self.embedding_dim, hidden_dim=self.hidden_dim,
-            action_dim=self.action_space.n, num_objects=self.num_objects, ignore_action=False, copy_action=True
-        )
+        if self.use_transition_net:
+            self.transition_net = TransitionGNN(
+                input_dim=self.embedding_dim, output_dim=self.embedding_dim, hidden_dim=self.hidden_dim,
+                action_dim=self.action_space.n, num_objects=self.num_objects, ignore_action=False, copy_action=True
+            )
         self.value_net = TransitionGNN(
             input_dim=self.embedding_dim, output_dim=1, hidden_dim=self.hidden_dim,
             action_dim=self.action_space.n, num_objects=self.num_objects, ignore_action=True, copy_action=True,
@@ -987,8 +984,11 @@ class ActorCriticCSWMPolicy(BasePolicy):
         distribution = self._get_action_dist_from_latent(features)
         log_prob = distribution.log_prob(actions)
         values = self.value_net(features)
-        return values, log_prob, distribution.entropy(),\
-            features.view(features.size()[0], self.num_objects, -1), self.transition_net(features, actions)
+        if self.use_transition_net:
+            return values, log_prob, distribution.entropy(),\
+                features.view(features.size()[0], self.num_objects, -1), self.transition_net(features, actions)
+        else:
+            return values, log_prob, distribution.entropy()
 
     def get_distribution(self, obs: th.Tensor) -> Distribution:
         """
