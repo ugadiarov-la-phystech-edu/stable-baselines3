@@ -219,7 +219,7 @@ class Push(gym.Env):
         state = np.full(shape=[self.w, self.w], fill_value=-1, dtype=np.int32)
 
         # sample random locations for objects
-        locs = np.random.choice(self.w ** 2, self.n_boxes, replace=False)
+        locs = self.np_random.choice(self.w ** 2, self.n_boxes, replace=False)
 
         xs, ys = np.unravel_index(locs, [self.w, self.w])
 
