@@ -9,6 +9,7 @@ from typing import Dict, Iterable, Optional, Tuple, Union
 import gym
 import numpy as np
 import torch as th
+from torch import nn
 
 import stable_baselines3 as sb3
 
@@ -503,3 +504,18 @@ def get_system_info(print_info: bool = True) -> Tuple[Dict[str, str], str]:
     if print_info:
         print(env_info_str)
     return env_info, env_info_str
+
+
+def get_act_fn(act_fn):
+    if act_fn == 'relu':
+        return nn.ReLU()
+    elif act_fn == 'leaky_relu':
+        return nn.LeakyReLU()
+    elif act_fn == 'elu':
+        return nn.ELU()
+    elif act_fn == 'sigmoid':
+        return nn.Sigmoid()
+    elif act_fn == 'softplus':
+        return nn.Softplus()
+    else:
+        raise ValueError('Invalid argument for `act_fn`.')

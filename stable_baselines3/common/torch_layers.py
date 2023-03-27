@@ -8,6 +8,7 @@ from torch import nn
 from stable_baselines3.common.preprocessing import get_flattened_obs_dim, is_image_space
 from stable_baselines3.common.type_aliases import TensorDict
 from stable_baselines3.common.utils import get_device
+import stable_baselines3.common.utils as utils
 
 
 class BaseFeaturesExtractor(nn.Module):
@@ -315,3 +316,82 @@ def get_actor_critic_arch(net_arch: Union[List[int], Dict[str, List[int]]]) -> T
         assert "qf" in net_arch, "Error: no key 'qf' was provided in net_arch for the critic network"
         actor_arch, critic_arch = net_arch["pi"], net_arch["qf"]
     return actor_arch, critic_arch
+
+
+class EncoderCNNLarge(nn.Module):
+    """CNN encoder, maps observation to obj-specific feature maps."""
+
+    def __init__(self, observation_space: gym.spaces.Box, hidden_dim, num_objects, act_fn='sigmoid',
+                 act_fn_hid='relu', shuffle_objects=False):
+        super(EncoderCNNLarge, self).__init__()
+        self.shuffle_objects = shuffle_objects
+        self.is_frozen = False
+        input_dim = observation_space.shape[0]
+
+        self.cnn1 = nn.Conv2d(input_dim, hidden_dim, (3, 3), padding=1)
+        self.act1 = utils.get_act_fn(act_fn_hid)
+        self.ln1 = nn.BatchNorm2d(hidden_dim)
+
+        self.cnn2 = nn.Conv2d(hidden_dim, hidden_dim, (3, 3), padding=1)
+        self.act2 = utils.get_act_fn(act_fn_hid)
+        self.ln2 = nn.BatchNorm2d(hidden_dim)
+
+        self.cnn3 = nn.Conv2d(hidden_dim, hidden_dim, (3, 3), padding=1)
+        self.act3 = utils.get_act_fn(act_fn_hid)
+        self.ln3 = nn.BatchNorm2d(hidden_dim)
+
+        self.cnn4 = nn.Conv2d(hidden_dim, num_objects, (3, 3), padding=1)
+        self.act4 = utils.get_act_fn(act_fn)
+
+    def freeze(self):
+        super().train(False)
+        self.requires_grad_(False)
+        self.is_frozen = True
+
+    def train(self, mode=True):
+        if self.is_frozen:
+            return self
+
+        return super().train(mode)
+
+    def forward(self, obs):
+        h = self.act1(self.ln1(self.cnn1(obs)))
+        h = self.act2(self.ln2(self.cnn2(h)))
+        h = self.act3(self.ln3(self.cnn3(h)))
+        h = self.act4(self.cnn4(h))
+        if self.shuffle_objects:
+            idx = th.randperm(h.size(1))
+            return h[:, idx]
+
+        return h
+
+
+class EntailedNatureCNN(BaseFeaturesExtractor):
+    def __init__(self, observation_space: gym.spaces.Box, encoder_kwargs, pretrained_path=None, features_dim: int = 512):
+        super(EntailedNatureCNN, self).__init__(observation_space, features_dim)
+        self.encoder = EncoderCNNLarge(observation_space, **encoder_kwargs)
+        self.pretrained_path = pretrained_path
+
+        n_input_channels = encoder_kwargs['num_objects']
+        self.cnn = nn.Sequential(
+            nn.Conv2d(n_input_channels, 32, kernel_size=8, stride=4, padding=0),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+
+        # Compute shape by doing one forward pass
+        with th.no_grad():
+            n_flatten = self.cnn(self.encoder(th.as_tensor(observation_space.sample()[None]).float())).shape[1]
+
+        self.linear = nn.Sequential(nn.Linear(n_flatten, features_dim), nn.ReLU())
+
+    def load_pretrained_encoder(self):
+        self.encoder.load_state_dict(th.load(self.pretrained_path))
+        self.encoder.freeze()
+
+    def forward(self, observations: th.Tensor) -> th.Tensor:
+        return self.linear(self.cnn(self.encoder(observations)))
