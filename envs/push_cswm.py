@@ -96,6 +96,7 @@ class Push(gym.Env):
     GOAL = 'goal'
     STATIC_BOX = 'static_box'
     BOX = 'box'
+    MOVING_BOXES_KEY = 'moving_boxes'
 
     STEP_REWARD = -0.01
     OUT_OF_FIELD_REWARD = -0.1
@@ -301,6 +302,8 @@ class Push(gym.Env):
 
         done = False
         reward = Push.STEP_REWARD
+        moving_boxes = [0] * self.n_boxes
+        moving_boxes[box_id] = 1
 
         if not self._is_in_grid(box_old_pos, box_id):
             # This box is out of the game. There is nothing to do.
@@ -324,6 +327,7 @@ class Push(gym.Env):
             if box_type == Push.BOX:
                 if another_box_type == Push.BOX:
                     if self.ternary_interactions:
+                        moving_boxes[another_box_id] = 1
                         another_box_new_pos = box_new_pos + vec
                         if self._is_in_grid(another_box_new_pos, another_box_id):
                             if self._is_free_cell(another_box_new_pos):
@@ -372,7 +376,7 @@ class Push(gym.Env):
         if self.n_boxes_in_game == 0:
             done = True
 
-        return self._get_observation(), reward, done, {}
+        return self._get_observation(), reward, done, {Push.MOVING_BOXES_KEY: moving_boxes}
 
     def _is_in_grid(self, point, box_id):
         if not self.embodied_agent or box_id == 0:
