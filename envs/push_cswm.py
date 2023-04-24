@@ -370,13 +370,15 @@ class Push(gym.Env):
             self._move(box_id, box_new_pos)
 
         self.steps_taken += 1
+        info = {Push.MOVING_BOXES_KEY: moving_boxes}
         if self.steps_taken >= self.step_limit:
+            info["TimeLimit.truncated"] = True
             done = True
 
         if self.n_boxes_in_game == 0:
             done = True
 
-        return self._get_observation(), reward, done, {Push.MOVING_BOXES_KEY: moving_boxes}
+        return self._get_observation(), reward, done, info
 
     def _is_in_grid(self, point, box_id):
         if not self.embodied_agent or box_id == 0:
