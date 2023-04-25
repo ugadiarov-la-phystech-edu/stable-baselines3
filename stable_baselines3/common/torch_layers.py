@@ -395,3 +395,90 @@ class EntailedNatureCNN(BaseFeaturesExtractor):
 
     def forward(self, observations: th.Tensor) -> th.Tensor:
         return self.linear(self.cnn(self.encoder(observations)))
+
+
+class ResBlock(nn.Module):
+    def __init__(self, input_ch, output_ch):
+        super().__init__()
+
+        layers = [
+            nn.ReLU(inplace=True),
+            nn.Conv2d(input_ch, output_ch, kernel_size=3, stride=1, padding=1),  # padding SAME
+            nn.ReLU(inplace=True),
+            nn.Conv2d(output_ch, output_ch, kernel_size=3, stride=1, padding=1),  # padding SAME
+        ]
+
+        self.res_block_core = nn.Sequential(*layers)
+
+    def forward(self, x: th.Tensor):
+        identity = x
+        out = self.res_block_core(x)
+        out = out + identity
+        return out
+
+
+def fc_layer(in_features: int, out_features: int, bias=True, spec_norm=False) -> nn.Module:
+    layer = nn.Linear(in_features, out_features, bias)
+    if spec_norm:
+        layer = nn.utils.spectral_norm(layer)
+
+    return layer
+
+
+def create_mlp_resnet(layer_sizes: List[int], input_size: int, activation: nn.Module) -> nn.Module:
+    """Sequential fully connected layers."""
+    layers = []
+    for i, size in enumerate(layer_sizes):
+        layers.extend([fc_layer(input_size, size), activation])
+        input_size = size
+
+    if len(layers) > 0:
+        return nn.Sequential(*layers)
+    else:
+        return nn.Identity()
+
+
+class ResnetEncoder(BaseFeaturesExtractor):
+    def __init__(self, observation_space: gym.spaces.Box, features_dim: int = 512, encoder_conv_mlp_layers=()):
+        super().__init__(observation_space, features_dim)
+        self.encoder_conv_mlp_layers = encoder_conv_mlp_layers
+
+        input_ch = observation_space.shape[0]
+        resnet_conf = [[16, 2], [32, 2], [32, 2]]
+
+        curr_input_channels = input_ch
+        layers = []
+        for i, (out_channels, res_blocks) in enumerate(resnet_conf):
+            layers.extend(
+                [
+                    nn.Conv2d(curr_input_channels, out_channels, kernel_size=3, stride=1, padding=1),  # padding SAME
+                    nn.MaxPool2d(kernel_size=3, stride=2, padding=1),  # padding SAME
+                ]
+            )
+
+            for j in range(res_blocks):
+                layers.append(ResBlock(out_channels, out_channels))
+
+            curr_input_channels = out_channels
+
+        activation = nn.ReLU(inplace=True)
+        layers.append(activation)
+
+        self.conv_head = nn.Sequential(*layers)
+        with th.no_grad():
+            self.conv_head_out_size = self.conv_head(th.as_tensor(observation_space.sample()[None]).float()).view(1, -1).shape[1]
+
+        self.mlp_layers = create_mlp_resnet(self.encoder_conv_mlp_layers + (features_dim,), self.conv_head_out_size, activation)
+
+        with th.no_grad():
+            self.encoder_out_size = self.mlp_layers(self.conv_head(th.as_tensor(observation_space.sample()[None]).float()).view(1, -1)).shape[1]
+            assert features_dim == self.encoder_out_size
+
+    def forward(self, obs: th.Tensor):
+        x = self.conv_head(obs)
+        x = x.contiguous().view(-1, self.conv_head_out_size)
+        x = self.mlp_layers(x)
+        return x
+
+    def get_out_size(self) -> int:
+        return self.encoder_out_size
