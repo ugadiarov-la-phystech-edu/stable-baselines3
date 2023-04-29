@@ -93,6 +93,7 @@ def scalene_triangle(r0, c0, width, im_size):
 
 
 class Push(gym.Env):
+    AGENT = 'agent'
     GOAL = 'goal'
     STATIC_BOX = 'static_box'
     BOX = 'box'
@@ -108,7 +109,7 @@ class Push(gym.Env):
     def __init__(self, n_boxes=5, n_static_boxes=0, n_goals=1, static_goals=True, width=5,
                  embodied_agent=False, return_state=True, observation_type='shapes', max_episode_steps=75,
                  border_walls=True, channels_first=True, channel_wise=False, channels_for_static_objects=True,
-                 seed=None, render_scale=10, ternary_interactions=False,
+                 seed=None, render_scale=10,
                  ):
         if n_static_boxes > 0:
             assert n_goals == 0 or static_goals, 'Cannot have movable goals with static objects.'
@@ -120,7 +121,7 @@ class Push(gym.Env):
         self.step_limit = max_episode_steps
         self.n_boxes = n_boxes
         self.embodied_agent = embodied_agent
-        self.ternary_interactions = ternary_interactions
+        self.n_interactions_per_step = None
 
         self.goal_ids = set()
         self.static_box_ids = set()
@@ -218,7 +219,7 @@ class Push(gym.Env):
         return image
 
     def reset(self):
-        state = np.full(shape=[self.w, self.w], fill_value=-1, dtype=np.int32)
+        self._clear_state()
 
         # sample random locations for objects
         if self.embodied_agent:
@@ -253,10 +254,8 @@ class Push(gym.Env):
 
         # populate state with locations
         for i, (x, y) in enumerate(zip(xs, ys)):
-            state[x, y] = i
-            self.box_pos[i, :] = x, y
+            self._set_position(box_id=i, x=x, y=y)
 
-        self.state = state
         self.steps_taken = 0
         self.n_boxes_in_game = self.n_boxes - len(self.goal_ids) - int(self.embodied_agent)
         if not self.embodied_agent:
@@ -264,11 +263,24 @@ class Push(gym.Env):
 
         return self._get_observation()
 
+    def _clear_state(self):
+        self.state = np.full(shape=[self.w, self.w], fill_value=-1, dtype=np.int32)
+        self.box_pos = np.full(shape=(self.n_boxes, 2), fill_value=-1, dtype=np.int32)
+
+    def _set_position(self, box_id, x, y):
+        self.state[x, y] = box_id
+        self.box_pos[box_id, :] = x, y
+
+    def _is_agent(self, box_id):
+        return self.embodied_agent and box_id == 0
+
     def _get_type(self, box_id):
         if box_id in self.goal_ids:
             return Push.GOAL
         elif box_id in self.static_box_ids:
             return Push.STATIC_BOX
+        elif self._is_agent(box_id):
+            return Push.AGENT
         else:
             return Push.BOX
 
@@ -279,11 +291,99 @@ class Push(gym.Env):
         if self._get_type(box_id) == Push.BOX or (not self.embodied_agent and self._get_type(box_id) == Push.STATIC_BOX):
             self.n_boxes_in_game -= 1
 
-    def _move(self, box_id, new_pos):
+    def _move_one_box(self, box_id, new_pos):
         old_pos = self.box_pos[box_id]
         self.state[old_pos[0], old_pos[1]] = -1
         self.state[new_pos[0], new_pos[1]] = box_id
         self.box_pos[box_id] = new_pos
+
+    def _move(self, box_id, displacement, n_interactions):
+        box_type = self._get_type(box_id)
+        box_old_pos = self.box_pos[box_id]
+        box_new_pos = box_old_pos + displacement
+        if not self._is_in_grid(box_new_pos, box_id):
+            reward = Push.OUT_OF_FIELD_REWARD
+            done = False
+            movement = False
+            if not self.border_walls:
+                # push out of grid, destroy object or finish episode if an agent is out of the grid
+                if box_type == Push.GOAL:
+                    reward += Push.DESTROY_GOAL_REWARD
+                elif box_type == Push.AGENT:
+                    reward += Push.DEATH_REWARD
+                    done = True
+                movement = True
+            return reward, done, [box_id], movement
+        elif self._is_free_cell(box_new_pos):
+            self._move_one_box(box_id, box_new_pos)
+            reward = 0
+            done = False
+            movement = True
+            return reward, done, [box_id], movement
+        else:
+            if self.n_interactions_per_step is not None and n_interactions >= self.n_interactions_per_step:
+                # Reached the limit of interactions during one step
+                reward = Push.COLLISION_REWARD
+                done = False
+                movement = False
+                return reward, done, [box_id], movement
+
+            # push into another box
+            another_box_id = self._get_occupied_box_id(box_new_pos)
+            another_box_type = self._get_type(another_box_id)
+            if box_type == Push.AGENT:
+                if another_box_type == Push.BOX:
+                    reward, done, affected_boxes, movement = self._move(another_box_id, displacement, n_interactions + 1)
+                    affected_boxes.append(box_id)
+                    if movement:
+                        self._move_one_box(box_id, box_new_pos)
+
+                    return reward, done, affected_boxes, movement
+                elif another_box_type in (Push.GOAL, Push.STATIC_BOX):
+                    reward = Push.COLLISION_REWARD
+                    done = False
+                    movement = False
+                    return reward, done, [box_id], movement
+                else:
+                    raise ValueError(f'Unexpected box type: {another_box_type}')
+            elif box_type == Push.BOX:
+                if another_box_type == Push.BOX:
+                    reward, done, affected_boxes, movement = self._move(another_box_id, displacement, n_interactions + 1)
+                    affected_boxes.append(box_id)
+                    if movement:
+                        self._move_one_box(box_id, box_new_pos)
+
+                    return reward, done, affected_boxes, movement
+                elif another_box_type == Push.GOAL:
+                    self._destroy_box(box_id)
+                    reward = Push.HIT_GOAL_REWARD
+                    done = False
+                    movement = True
+                    return reward, done, [box_id], movement
+                elif another_box_type == Push.STATIC_BOX:
+                    reward = Push.COLLISION_REWARD
+                    done = False
+                    movement = False
+                    return reward, done, [box_id], movement
+                else:
+                    raise ValueError(f'Unexpected box type: {another_box_type}')
+            elif box_type == Push.GOAL:
+                if another_box_type in (Push.BOX, Push.STATIC_BOX):
+                    self._destroy_box(another_box_id)
+                    self._move_one_box(box_id, box_new_pos)
+                    reward = Push.HIT_GOAL_REWARD
+                    done = False
+                    movement =True
+                    return reward, done, [box_id], movement
+                elif another_box_type == Push.GOAL:
+                    reward = Push.COLLISION_REWARD
+                    done = False
+                    movement = False
+                    return reward, done, [box_id], movement
+                else:
+                    raise ValueError(f'Unexpected box type: {another_box_type}')
+            else:
+                raise ValueError(f'Unexpected box type: {box_type}')
 
     def _is_free_cell(self, pos):
         return self.state[pos[0], pos[1]] == -1
@@ -296,78 +396,12 @@ class Push(gym.Env):
 
         vec = self.directions[action % len(self.directions)]
         box_id = action // len(self.directions)
-        box_old_pos = self.box_pos[box_id]
-        box_new_pos = box_old_pos + vec
-        box_type = self._get_type(box_id)
+        reward, done, affected_boxes, movement = self._move(box_id, vec, n_interactions=0)
+        reward += Push.STEP_REWARD
 
-        done = False
-        reward = Push.STEP_REWARD
         moving_boxes = [0] * self.n_boxes
-        moving_boxes[box_id] = 1
-
-        if not self._is_in_grid(box_old_pos, box_id):
-            # This box is out of the game. There is nothing to do.
-            pass
-        elif not self._is_in_grid(box_new_pos, box_id):
-            reward += Push.OUT_OF_FIELD_REWARD
-            if not self.border_walls:
-                # push out of grid, destroy object or finish episode if an agent is out of the grid
-                if box_type == Push.GOAL:
-                    reward += Push.DESTROY_GOAL_REWARD
-                elif self.embodied_agent:
-                    reward += Push.DEATH_REWARD
-                    done = True
-
-                self._destroy_box(box_id)
-        elif not self._is_free_cell(box_new_pos):
-            # push into another box
-            another_box_id = self._get_occupied_box_id(box_new_pos)
-            another_box_type = self._get_type(another_box_id)
-
-            if box_type == Push.BOX:
-                if another_box_type == Push.BOX:
-                    if self.ternary_interactions:
-                        moving_boxes[another_box_id] = 1
-                        another_box_new_pos = box_new_pos + vec
-                        if self._is_in_grid(another_box_new_pos, another_box_id):
-                            if self._is_free_cell(another_box_new_pos):
-                                self._move(another_box_id, another_box_new_pos)
-                                self._move(box_id, box_new_pos)
-                            elif self._get_type(self._get_occupied_box_id(another_box_new_pos)) == Push.GOAL:
-                                reward += Push.HIT_GOAL_REWARD
-                                self._destroy_box(another_box_id)
-                                self._move(box_id, box_new_pos)
-                            else:
-                                reward += Push.COLLISION_REWARD
-                        else:
-                            reward += Push.OUT_OF_FIELD_REWARD
-                            if not self.border_walls:
-                                self._destroy_box(another_box_id)
-                                self._move(box_id, box_new_pos)
-                    else:
-                        reward += Push.COLLISION_REWARD
-                elif another_box_type == Push.GOAL:
-                    if self.embodied_agent:
-                        reward += Push.COLLISION_REWARD
-                    else:
-                        reward += Push.HIT_GOAL_REWARD
-                        self._destroy_box(box_id)
-                else:
-                    assert another_box_type == Push.STATIC_BOX
-                    reward += Push.COLLISION_REWARD
-            elif box_type == Push.GOAL:
-                if another_box_type in (Push.BOX, Push.STATIC_BOX):
-                    self._destroy_box(another_box_id)
-                    self._move(box_id, box_new_pos)
-                    reward += Push.HIT_GOAL_REWARD
-                else:
-                    assert another_box_type == Push.GOAL
-                    reward += Push.COLLISION_REWARD
-            else:
-                assert False, f'Cannot move a box of type:{box_type}'
-        else:
-            # pushed into open space, move box
-            self._move(box_id, box_new_pos)
+        for box_id in affected_boxes:
+            moving_boxes[box_id] = 1
 
         self.steps_taken += 1
         info = {Push.MOVING_BOXES_KEY: moving_boxes}
@@ -530,7 +564,7 @@ if __name__ == "__main__":
     If called without arguments, starts an interactive game played with wasd to move, q to quit.
     """
     env = Push(n_boxes=5, n_static_boxes=0, n_goals=1, static_goals=True, observation_type='shapes', border_walls=True,
-               channels_first=False, width=7, embodied_agent=True, render_scale=10, return_state=False, ternary_interactions=True)
+               channels_first=False, width=7, embodied_agent=True, render_scale=10, return_state=False)
 
     if len(sys.argv) > 1:
         if sys.argv[1] == "random":
@@ -591,9 +625,9 @@ if __name__ == "__main__":
 
             a += 4 * obj_id
 
-            s, r, d, _ = env.step(a)
+            s, r, d, info = env.step(a)
             episode_r += r
-            env.print(f'. Episode reward: {episode_r}')
+            env.print(f'. Episode reward: {episode_r}. Moving objects: {info[Push.MOVING_BOXES_KEY]}')
             plt.imshow(s)
             plt.show()
             if d or key == "r":
