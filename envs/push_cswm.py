@@ -108,7 +108,7 @@ class Push(gym.Env):
     def __init__(self, n_boxes=5, n_static_boxes=0, n_goals=1, static_goals=True, width=5,
                  embodied_agent=False, return_state=True, observation_type='shapes', max_episode_steps=75,
                  border_walls=True, channels_first=True, channel_wise=False, channels_for_static_objects=True,
-                 seed=None, render_scale=10, ternary_interactions=False,
+                 seed=None, render_scale=10, ternary_interactions=False, push_reward=False
                  ):
         if n_static_boxes > 0:
             assert n_goals == 0 or static_goals, 'Cannot have movable goals with static objects.'
@@ -121,6 +121,7 @@ class Push(gym.Env):
         self.n_boxes = n_boxes
         self.embodied_agent = embodied_agent
         self.ternary_interactions = ternary_interactions
+        self.push_reward = push_reward
 
         self.goal_ids = set()
         self.static_box_ids = set()
@@ -258,7 +259,7 @@ class Push(gym.Env):
 
         self.state = state
         self.steps_taken = 0
-        self.n_boxes_in_game = self.n_boxes - len(self.goal_ids) - int(self.embodied_agent)
+        self.n_boxes_in_game = self.n_boxes - len(self.goal_ids) - int(self.embodied_agent) - int(self.push_reward)
         if not self.embodied_agent:
             self.n_boxes_in_game -= len(self.static_box_ids) * int(self.static_goals)
 
@@ -347,7 +348,7 @@ class Push(gym.Env):
                     else:
                         reward += Push.COLLISION_REWARD
                 elif another_box_type == Push.GOAL:
-                    if self.embodied_agent:
+                    if self.embodied_agent or self.push_reward:
                         reward += Push.COLLISION_REWARD
                     else:
                         reward += Push.HIT_GOAL_REWARD
