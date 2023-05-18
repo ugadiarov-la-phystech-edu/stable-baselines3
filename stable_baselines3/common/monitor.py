@@ -54,6 +54,7 @@ class Monitor(gym.Wrapper):
         self.episode_returns = []
         self.episode_lengths = []
         self.episode_times = []
+        self.episode_success_rates = []
         self.total_steps = 0
         self.current_reset_info = {}  # extra info about the current episode, that was passed in during reset()
 
@@ -93,12 +94,14 @@ class Monitor(gym.Wrapper):
             self.needs_reset = True
             ep_rew = sum(self.rewards)
             ep_len = len(self.rewards)
-            ep_info = {"r": round(ep_rew, 6), "l": ep_len, "t": round(time.time() - self.t_start, 6)}
+            success_rate = 1 - int(info.get("TimeLimit.truncated", False))
+            ep_info = {"r": round(ep_rew, 6), "l": ep_len, "t": round(time.time() - self.t_start, 6), "sr": success_rate}
             for key in self.info_keywords:
                 ep_info[key] = info[key]
             self.episode_returns.append(ep_rew)
             self.episode_lengths.append(ep_len)
             self.episode_times.append(time.time() - self.t_start)
+            self.episode_success_rates.append(success_rate)
             ep_info.update(self.current_reset_info)
             if self.results_writer:
                 self.results_writer.write_row(ep_info)
@@ -129,6 +132,14 @@ class Monitor(gym.Wrapper):
         :return:
         """
         return self.episode_returns
+
+    def get_episode_success_rates(self) -> List[float]:
+        """
+        Returns the rewards of all the episodes
+
+        :return:
+        """
+        return self.episode_success_rates
 
     def get_episode_lengths(self) -> List[int]:
         """
