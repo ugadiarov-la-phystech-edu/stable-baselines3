@@ -108,7 +108,7 @@ class Push(gym.Env):
     def __init__(self, n_boxes=5, n_static_boxes=0, n_goals=1, static_goals=True, width=5,
                  embodied_agent=False, return_state=True, observation_type='shapes', max_episode_steps=75,
                  border_walls=True, channels_first=True, channel_wise=False, channels_for_static_objects=True,
-                 seed=None, render_scale=10, ternary_interactions=False, push_reward=False
+                 seed=None, render_scale=10, ternary_interactions=False, push_reward=False, symmetric=True,
                  ):
         if n_static_boxes > 0:
             assert n_goals == 0 or static_goals, 'Cannot have movable goals with static objects.'
@@ -187,6 +187,19 @@ class Push(gym.Env):
         self.pos = None
         self.image = None
         self.box_pos = np.zeros(shape=(self.n_boxes, 2), dtype=np.int32)
+        self.symmetric = symmetric
+        self.positive_reward_box_ids = set(range(self.n_boxes))
+        self.pace = [{direction: 1 for direction in self.direction2action} for _ in range(self.n_boxes)]
+        self.hit_goal_reward = [Push.HIT_GOAL_REWARD] * self.n_boxes
+        if not self.symmetric and not self.embodied_agent:
+            for box_id in range(self.n_boxes):
+                for direction in self.pace[box_id]:
+                    if direction[box_id % 2] == 0:
+                        self.pace[box_id][direction] = 2
+
+                if box_id >= self.n_boxes // 2:
+                    self.hit_goal_reward[box_id] *= -1
+                    self.positive_reward_box_ids.remove(box_id)
 
         self.seed(seed)
         self.reset()
@@ -259,9 +272,12 @@ class Push(gym.Env):
 
         self.state = state
         self.steps_taken = 0
-        self.n_boxes_in_game = self.n_boxes - len(self.goal_ids) - int(self.embodied_agent) - int(self.push_reward)
-        if not self.embodied_agent:
-            self.n_boxes_in_game -= len(self.static_box_ids) * int(self.static_goals)
+        if not self.symmetric:
+            self.n_boxes_in_game = len(self.positive_reward_box_ids)
+        else:
+            self.n_boxes_in_game = self.n_boxes - len(self.goal_ids) - int(self.embodied_agent) - int(self.push_reward)
+            if not self.embodied_agent:
+                self.n_boxes_in_game -= len(self.static_box_ids) * int(self.static_goals)
 
         return self._get_observation()
 
@@ -277,7 +293,11 @@ class Push(gym.Env):
         box_pos = self.box_pos[box_id]
         self.state[box_pos[0], box_pos[1]] = -1
         self.box_pos[box_id] = -1, -1
-        if self._get_type(box_id) == Push.BOX or (not self.embodied_agent and self._get_type(box_id) == Push.STATIC_BOX):
+        if not self.symmetric:
+            if box_id in self.positive_reward_box_ids:
+                self.n_boxes_in_game -= 1
+        elif self._get_type(box_id) == Push.BOX or (
+                not self.embodied_agent and self._get_type(box_id) == Push.STATIC_BOX):
             self.n_boxes_in_game -= 1
 
     def _move(self, box_id, new_pos):
@@ -293,6 +313,23 @@ class Push(gym.Env):
         return self.state[pos[0], pos[1]]
 
     def step(self, action):
+        box_id = action // len(self.directions)
+        direction = tuple(self.directions[action % len(self.directions)].tolist())
+        pace = self.pace[box_id][direction]
+        reward = 0
+        moving_boxes = [0] * self.n_boxes
+
+        for sub_step in range(pace):
+            is_last_sub_step = sub_step == pace - 1
+            observation, sub_reward, done, info = self.step_(action, return_observation=is_last_sub_step, increment_step=is_last_sub_step)
+            reward += sub_reward
+            moving_boxes = [max(flag1, flag2) for flag1, flag2 in zip(moving_boxes, info[Push.MOVING_BOXES_KEY])]
+
+        info[Push.MOVING_BOXES_KEY] = moving_boxes
+
+        return observation, reward, done, info
+
+    def step_(self, action, return_observation=False, increment_step=False):
         assert self.action_space.contains(action), "%r (%s) invalid" % (action, type(action))
 
         vec = self.directions[action % len(self.directions)]
@@ -302,7 +339,7 @@ class Push(gym.Env):
         box_type = self._get_type(box_id)
 
         done = False
-        reward = Push.STEP_REWARD
+        reward = Push.STEP_REWARD if increment_step else 0
         moving_boxes = [0] * self.n_boxes
         moving_boxes[box_id] = 1
 
@@ -335,7 +372,7 @@ class Push(gym.Env):
                                 self._move(another_box_id, another_box_new_pos)
                                 self._move(box_id, box_new_pos)
                             elif self._get_type(self._get_occupied_box_id(another_box_new_pos)) == Push.GOAL:
-                                reward += Push.HIT_GOAL_REWARD
+                                reward += self.hit_goal_reward[another_box_id]
                                 self._destroy_box(another_box_id)
                                 self._move(box_id, box_new_pos)
                             else:
@@ -351,7 +388,7 @@ class Push(gym.Env):
                     if self.embodied_agent or self.push_reward:
                         reward += Push.COLLISION_REWARD
                     else:
-                        reward += Push.HIT_GOAL_REWARD
+                        reward += self.hit_goal_reward[box_id]
                         self._destroy_box(box_id)
                 else:
                     assert another_box_type == Push.STATIC_BOX
@@ -360,7 +397,7 @@ class Push(gym.Env):
                 if another_box_type in (Push.BOX, Push.STATIC_BOX):
                     self._destroy_box(another_box_id)
                     self._move(box_id, box_new_pos)
-                    reward += Push.HIT_GOAL_REWARD
+                    reward += self.hit_goal_reward[another_box_id]
                 else:
                     assert another_box_type == Push.GOAL
                     reward += Push.COLLISION_REWARD
@@ -370,7 +407,9 @@ class Push(gym.Env):
             # pushed into open space, move box
             self._move(box_id, box_new_pos)
 
-        self.steps_taken += 1
+        if increment_step:
+            self.steps_taken += 1
+
         info = {Push.MOVING_BOXES_KEY: moving_boxes}
         if self.steps_taken >= self.step_limit:
             info["TimeLimit.truncated"] = True
@@ -379,7 +418,8 @@ class Push(gym.Env):
         if self.n_boxes_in_game == 0:
             done = True
 
-        return self._get_observation(), reward, done, info
+        observation = self._get_observation() if return_observation else None
+        return observation, reward, done, info
 
     def _is_in_grid(self, point, box_id):
         if not self.embodied_agent or box_id == 0:
