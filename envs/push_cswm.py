@@ -361,22 +361,25 @@ class Push(gym.Env):
             # push into another box
             another_box_id = self._get_occupied_box_id(box_new_pos)
             another_box_type = self._get_type(another_box_id)
+            moving_boxes[another_box_id] = 1
 
             if box_type == Push.BOX:
                 if another_box_type == Push.BOX:
                     if self.ternary_interactions:
-                        moving_boxes[another_box_id] = 1
                         another_box_new_pos = box_new_pos + vec
                         if self._is_in_grid(another_box_new_pos, another_box_id):
                             if self._is_free_cell(another_box_new_pos):
                                 self._move(another_box_id, another_box_new_pos)
                                 self._move(box_id, box_new_pos)
-                            elif self._get_type(self._get_occupied_box_id(another_box_new_pos)) == Push.GOAL:
-                                reward += self.hit_goal_reward[another_box_id]
-                                self._destroy_box(another_box_id)
-                                self._move(box_id, box_new_pos)
                             else:
-                                reward += Push.COLLISION_REWARD
+                                third_box_id = self._get_occupied_box_id(another_box_new_pos)
+                                moving_boxes[third_box_id] = 1
+                                if self._get_type(third_box_id) == Push.GOAL:
+                                    reward += self.hit_goal_reward[another_box_id]
+                                    self._destroy_box(another_box_id)
+                                    self._move(box_id, box_new_pos)
+                                else:
+                                    reward += Push.COLLISION_REWARD
                         else:
                             reward += Push.OUT_OF_FIELD_REWARD
                             if not self.border_walls:
