@@ -394,6 +394,9 @@ class Push(gym.Env):
             info["TimeLimit.truncated"] = True
             done = True
 
+        info['n_active_boxes_in_game'] = len(self.active_box_ids_in_game)
+        info['n_passive_boxes_in_game'] = len(self.passive_box_ids_in_game)
+
         observation = self._get_observation() if return_observation else None
         return observation, reward, done, info
 
