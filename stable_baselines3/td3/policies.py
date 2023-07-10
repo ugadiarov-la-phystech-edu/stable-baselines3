@@ -1,10 +1,10 @@
-from typing import Any, Dict, List, Optional, Type, Union
+from typing import Any, Dict, List, Optional, Type, Union, Tuple
 
 import gym
 import torch as th
 from torch import nn
 
-from stable_baselines3.common.policies import BasePolicy, ContinuousCritic, register_policy
+from stable_baselines3.common.policies import BasePolicy, ContinuousCritic, register_policy, BaseModel
 from stable_baselines3.common.preprocessing import get_action_dim
 from stable_baselines3.common.torch_layers import (
     BaseFeaturesExtractor,
@@ -351,6 +351,342 @@ class MultiInputPolicy(TD3Policy):
             n_critics,
             share_features_extractor,
         )
+
+
+class TransitionModel(BaseModel):
+    def __init__(
+        self,
+        observation_space: gym.spaces.Space,
+        action_space: gym.spaces.Space,
+        net_arch: List[int],
+        features_dim: int,
+        activation_fn: Type[nn.Module] = nn.ReLU,
+    ):
+        super().__init__(
+            observation_space,
+            action_space,
+            features_extractor=None,
+            normalize_images=False,
+        )
+
+        action_dim = get_action_dim(self.action_space)
+        self.network = nn.Sequential(*create_mlp(features_dim + action_dim, features_dim, net_arch, activation_fn))
+
+    def forward(self, states: th.Tensor, actions: th.Tensor) -> Tuple[th.Tensor, ...]:
+        states_actions = th.cat([states, actions], dim=1)
+        return self.network(states_actions)
+
+
+class RewardModel(BaseModel):
+    def __init__(
+        self,
+        observation_space: gym.spaces.Space,
+        action_space: gym.spaces.Space,
+        net_arch: List[int],
+        features_dim: int,
+        activation_fn: Type[nn.Module] = nn.ReLU,
+    ):
+        super().__init__(
+            observation_space,
+            action_space,
+            features_extractor=None,
+            normalize_images=False,
+        )
+
+        action_dim = get_action_dim(self.action_space)
+        self.network = nn.Sequential(*create_mlp(features_dim + action_dim, 1, net_arch, activation_fn))
+
+    def forward(self, states: th.Tensor, actions: th.Tensor) -> Tuple[th.Tensor, ...]:
+        states_actions = th.cat([states, actions], dim=1)
+        return self.network(states_actions)
+
+
+class ValueModel(BaseModel):
+    def __init__(
+        self,
+        observation_space: gym.spaces.Space,
+        action_space: gym.spaces.Space,
+        net_arch: List[int],
+        features_dim: int,
+        activation_fn: Type[nn.Module] = nn.ReLU,
+    ):
+        super().__init__(
+            observation_space,
+            action_space,
+            features_extractor=None,
+            normalize_images=False,
+        )
+
+        self.network = nn.Sequential(*create_mlp(features_dim, 1, net_arch, activation_fn))
+
+    def forward(self, states: th.Tensor) -> Tuple[th.Tensor, ...]:
+        return self.network(states)
+
+
+class ContinuousCriticWM(BaseModel):
+    def __init__(
+        self,
+        observation_space: gym.spaces.Space,
+        action_space: gym.spaces.Space,
+        net_arch: List[int],
+        features_extractor: nn.Module,
+        features_dim: int,
+        activation_fn: Type[nn.Module] = nn.ReLU,
+        normalize_images: bool = True,
+        n_critics: int = 1,
+        share_features_extractor: bool = True,
+        gamma: float = 0.99,
+        depth: int = 1,
+        target_policy_noise: float = 0.2,
+        target_noise_clip: float = 0.5,
+    ):
+        super().__init__(
+            observation_space,
+            action_space,
+            features_extractor=features_extractor,
+            normalize_images=normalize_images,
+        )
+
+        self.gamma = gamma
+        self.depth = depth
+        self.n_critics = n_critics
+        self.target_policy_noise = target_policy_noise
+        self.target_noise_clip = target_noise_clip
+        self.transition_models = nn.ModuleList()
+        self.reward_models = nn.ModuleList()
+        self.value_models = nn.ModuleList()
+        for _ in range(self.n_critics):
+            self.transition_models.append(TransitionModel(observation_space, action_space, net_arch, features_dim, activation_fn))
+            self.reward_models.append(RewardModel(observation_space, action_space, net_arch, features_dim, activation_fn))
+            self.value_models.append(ValueModel(observation_space, action_space, net_arch, features_dim, activation_fn))
+
+        self.share_features_extractor = share_features_extractor
+
+    def forward(self, obs: th.Tensor, actions: th.Tensor, actor: Actor, use_noise=False) -> Tuple[th.Tensor, ...]:
+        # Learn the features extractor using the policy loss only
+        # when the features_extractor is shared with the actor
+        with th.set_grad_enabled(not self.share_features_extractor):
+            features = self.extract_features(obs)
+
+        q_values = []
+        for critic_id in range(self.n_critics):
+            transition_model = self.transition_models[critic_id]
+            reward_model = self.reward_models[critic_id]
+            value_model = self.value_models[critic_id]
+            states = [features]
+            actions = [actions]
+            for _ in range(self.depth):
+                next_state = transition_model(states[-1], actions[-1])
+                next_action = actor(next_state)
+
+                if use_noise:
+                    noise = next_action.clone().data.normal_(0, self.target_policy_noise)
+                    noise = noise.clamp(-self.target_noise_clip, self.target_noise_clip)
+                    next_action = (next_action + noise).clamp(-1, 1)
+                states.append(next_state)
+                actions.append(next_action)
+
+            q_value = value_model(states[self.depth])
+            for i in range(self.depth - 1, -1, -1):
+                q_value = reward_model(states[i], actions[i]) + self.gamma * q_value
+            q_values.append(q_value)
+
+        return tuple(q_values)
+
+    def q1_forward(self, obs: th.Tensor, actions: th.Tensor, actor: Actor) -> th.Tensor:
+        with th.no_grad():
+            features = self.extract_features(obs)
+
+        transition_model = self.transition_models[0]
+        reward_model = self.reward_models[0]
+        value_model = self.value_models[0]
+        states = [features]
+        actions = [actions]
+        for _ in range(self.depth):
+            next_state = transition_model(states[-1], actions[-1])
+            next_action = actor(next_state)
+            states.append(next_state)
+            actions.append(next_action)
+
+        q_value = value_model(states[self.depth])
+        for i in range(self.depth - 1, -1, -1):
+            q_value = reward_model(states[i], actions[i]) + self.gamma * q_value
+
+        return q_value
+
+
+class TD3WMPolicy(BasePolicy):
+    """
+    Policy class (with both actor and critic) for TD3.
+
+    :param observation_space: Observation space
+    :param action_space: Action space
+    :param lr_schedule: Learning rate schedule (could be constant)
+    :param net_arch: The specification of the policy and value networks.
+    :param activation_fn: Activation function
+    :param features_extractor_class: Features extractor to use.
+    :param features_extractor_kwargs: Keyword arguments
+        to pass to the features extractor.
+    :param normalize_images: Whether to normalize images or not,
+         dividing by 255.0 (True by default)
+    :param optimizer_class: The optimizer to use,
+        ``th.optim.Adam`` by default
+    :param optimizer_kwargs: Additional keyword arguments,
+        excluding the learning rate, to pass to the optimizer
+    :param n_critics: Number of critic networks to create.
+    :param share_features_extractor: Whether to share or not the features extractor
+        between the actor and the critic (this saves computation time)
+    """
+
+    def __init__(
+        self,
+        observation_space: gym.spaces.Space,
+        action_space: gym.spaces.Space,
+        lr_schedule: Schedule,
+        net_arch: Optional[Union[List[int], Dict[str, List[int]]]] = None,
+        activation_fn: Type[nn.Module] = nn.ReLU,
+        features_extractor_class: Type[BaseFeaturesExtractor] = FlattenExtractor,
+        features_extractor_kwargs: Optional[Dict[str, Any]] = None,
+        normalize_images: bool = True,
+        optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
+        optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        n_critics: int = 1,
+        share_features_extractor: bool = True,
+        gamma: float = 0.99,
+        depth: int = 1,
+        target_policy_noise: float = 0.2,
+        target_noise_clip: float = 0.5,
+    ):
+        super(TD3WMPolicy, self).__init__(
+            observation_space,
+            action_space,
+            features_extractor_class,
+            features_extractor_kwargs,
+            optimizer_class=optimizer_class,
+            optimizer_kwargs=optimizer_kwargs,
+            squash_output=True,
+        )
+
+        self.gamma = gamma
+        self.depth = depth
+        self.target_policy_noise = target_policy_noise
+        self.target_noise_clip = target_noise_clip
+        # Default network architecture, from the original paper
+        if net_arch is None:
+            if features_extractor_class == NatureCNN:
+                net_arch = []
+            else:
+                net_arch = [400, 300]
+
+        actor_arch = net_arch
+        critic_arch = net_arch
+
+        self.net_arch = net_arch
+        self.activation_fn = activation_fn
+        self.net_args = {
+            "observation_space": self.observation_space,
+            "action_space": self.action_space,
+            "net_arch": actor_arch,
+            "activation_fn": self.activation_fn,
+            "normalize_images": normalize_images,
+        }
+        self.actor_kwargs = self.net_args.copy()
+        self.critic_kwargs = self.net_args.copy()
+        self.critic_kwargs.update(
+            {
+                "n_critics": n_critics,
+                "net_arch": critic_arch,
+                "share_features_extractor": share_features_extractor,
+                "gamma": self.gamma,
+                "depth": self.depth,
+                "target_policy_noise": self.target_policy_noise,
+                "target_noise_clip": self.target_noise_clip,
+            }
+        )
+
+        self.actor, self.actor_target = None, None
+        self.critic, self.critic_target = None, None
+        self.share_features_extractor = share_features_extractor
+
+        self._build(lr_schedule)
+
+    def _build(self, lr_schedule: Schedule) -> None:
+        # Create actor and target
+        # the features extractor should not be shared
+        self.actor = self.make_actor(features_extractor=None)
+        self.actor_target = self.make_actor(features_extractor=None)
+        # Initialize the target to have the same weights as the actor
+        self.actor_target.load_state_dict(self.actor.state_dict())
+
+        self.actor.optimizer = self.optimizer_class(self.actor.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
+
+        if self.share_features_extractor:
+            self.critic = self.make_critic(features_extractor=self.actor.features_extractor)
+            # Critic target should not share the features extactor with critic
+            # but it can share it with the actor target as actor and critic are sharing
+            # the same features_extractor too
+            # NOTE: as a result the effective poliak (soft-copy) coefficient for the features extractor
+            # will be 2 * tau instead of tau (updated one time with the actor, a second time with the critic)
+            self.critic_target = self.make_critic(features_extractor=self.actor_target.features_extractor)
+        else:
+            # Create new features extractor for each network
+            self.critic = self.make_critic(features_extractor=None)
+            self.critic_target = self.make_critic(features_extractor=None)
+
+        self.critic_target.load_state_dict(self.critic.state_dict())
+        self.critic.optimizer = self.optimizer_class(self.critic.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
+
+        # Target networks should always be in eval mode
+        self.actor_target.set_training_mode(False)
+        self.critic_target.set_training_mode(False)
+
+    def _get_constructor_parameters(self) -> Dict[str, Any]:
+        data = super()._get_constructor_parameters()
+
+        data.update(
+            dict(
+                net_arch=self.net_arch,
+                activation_fn=self.net_args["activation_fn"],
+                n_critics=self.critic_kwargs["n_critics"],
+                lr_schedule=self._dummy_schedule,  # dummy lr schedule, not needed for loading policy alone
+                optimizer_class=self.optimizer_class,
+                optimizer_kwargs=self.optimizer_kwargs,
+                features_extractor_class=self.features_extractor_class,
+                features_extractor_kwargs=self.features_extractor_kwargs,
+                share_features_extractor=self.share_features_extractor,
+                gamma=self.gamma,
+                depth=self.depth,
+            )
+        )
+        return data
+
+    def make_actor(self, features_extractor: Optional[BaseFeaturesExtractor] = None) -> Actor:
+        actor_kwargs = self._update_features_extractor(self.actor_kwargs, features_extractor)
+        return Actor(**actor_kwargs).to(self.device)
+
+    def make_critic(self, features_extractor: Optional[BaseFeaturesExtractor] = None) -> ContinuousCriticWM:
+        critic_kwargs = self._update_features_extractor(self.critic_kwargs, features_extractor)
+        return ContinuousCriticWM(**critic_kwargs).to(self.device)
+
+    def forward(self, observation: th.Tensor, deterministic: bool = False) -> th.Tensor:
+        return self._predict(observation, deterministic=deterministic)
+
+    def _predict(self, observation: th.Tensor, deterministic: bool = False) -> th.Tensor:
+        # Note: the deterministic deterministic parameter is ignored in the case of TD3.
+        #   Predictions are always deterministic.
+        return self.actor(observation)
+
+    def set_training_mode(self, mode: bool) -> None:
+        """
+        Put the policy in either training or evaluation mode.
+
+        This affects certain modules, such as batch normalisation and dropout.
+
+        :param mode: if true, set to training mode, else set to evaluation mode
+        """
+        self.actor.set_training_mode(mode)
+        self.critic.set_training_mode(mode)
+        self.training = mode
 
 
 register_policy("MlpPolicy", MlpPolicy)
