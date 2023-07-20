@@ -2,6 +2,7 @@ import warnings
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import gym
+import numpy as np
 import torch as th
 from torch import nn
 
@@ -537,7 +538,7 @@ class TransitionModel(BaseModel):
 
     def forward(self, states: th.Tensor, actions: th.Tensor) -> Tuple[th.Tensor, ...]:
         states_actions = th.cat([states, actions], dim=1)
-        return self.network(states_actions)
+        return self.network(states_actions) + states
 
 
 class RewardModel(BaseModel):
@@ -591,7 +592,7 @@ class ContinuousCriticWM(BaseModel):
         self,
         observation_space: gym.spaces.Space,
         action_space: gym.spaces.Space,
-        net_arch: List[int],
+        net_arch: Dict[str, List[int]],
         features_extractor: nn.Module,
         features_dim: int,
         activation_fn: Type[nn.Module] = nn.ReLU,
@@ -615,9 +616,13 @@ class ContinuousCriticWM(BaseModel):
         self.reward_models = nn.ModuleList()
         self.value_models = nn.ModuleList()
         for _ in range(self.n_critics):
-            self.transition_models.append(TransitionModel(observation_space, action_space, net_arch, features_dim, activation_fn))
-            self.reward_models.append(RewardModel(observation_space, action_space, net_arch, features_dim, activation_fn))
-            self.value_models.append(ValueModel(observation_space, action_space, net_arch, features_dim, activation_fn))
+            self.transition_models.append(
+                TransitionModel(observation_space, action_space, net_arch['transition_model'], features_dim,
+                                activation_fn))
+            self.reward_models.append(
+                RewardModel(observation_space, action_space, net_arch['reward_model'], features_dim, activation_fn))
+            self.value_models.append(
+                ValueModel(observation_space, action_space, net_arch['value_model'], features_dim, activation_fn))
 
         self.share_features_extractor = share_features_extractor
 
@@ -706,7 +711,7 @@ class SACWMPolicy(BasePolicy):
         observation_space: gym.spaces.Space,
         action_space: gym.spaces.Space,
         lr_schedule: Schedule,
-        net_arch: Optional[Union[List[int], Dict[str, List[int]]]] = None,
+        net_arch: Optional[Dict[str, List[int]]] = None,
         activation_fn: Type[nn.Module] = nn.ReLU,
         use_sde: bool = False,
         log_std_init: float = -3,
@@ -733,6 +738,8 @@ class SACWMPolicy(BasePolicy):
             squash_output=True,
         )
 
+        assert share_features_extractor, f'Features extractor must be shared!'
+
         self.gamma = gamma
         self.depth = depth
 
@@ -742,7 +749,10 @@ class SACWMPolicy(BasePolicy):
             else:
                 net_arch = [256, 256]
 
-        actor_arch, critic_arch = net_arch, net_arch
+            net_arch = {'actor': net_arch.copy(), 'critic': {model_name: net_arch.copy() for model_name in
+                                                             ('transition_model', 'reward_model', 'value_model')}}
+
+        actor_arch, critic_arch = net_arch['actor'], net_arch['critic']
 
         self.net_arch = net_arch
         self.activation_fn = activation_fn
@@ -779,26 +789,35 @@ class SACWMPolicy(BasePolicy):
         self.actor, self.actor_target = None, None
         self.critic, self.critic_target = None, None
         self.share_features_extractor = share_features_extractor
+        self.features_extractor = self.make_features_extractor()
+
+        self.features_extractor_target = self.make_features_extractor()
+        self.features_extractor_target.load_state_dict(self.features_extractor.state_dict())
+        self.features_extractor_target.train(False)
 
         self._build(lr_schedule)
 
     def _build(self, lr_schedule: Schedule) -> None:
-        self.actor = self.make_actor()
-        self.actor.optimizer = self.optimizer_class(self.actor.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
+        self.actor = self.make_actor(FlattenExtractor(
+            gym.spaces.Box(low=-np.inf, high=np.inf, shape=(self.features_extractor.features_dim,), dtype=np.float32)))
+        self.actor.optimizer = self.optimizer_class(
+            list(self.actor.parameters()) + list(self.features_extractor.parameters()), lr=lr_schedule(1),
+            **self.optimizer_kwargs)
 
         if self.share_features_extractor:
             self.critic = self.make_critic(features_extractor=self.actor.features_extractor)
             # Do not optimize the shared features extractor with the critic loss
             # otherwise, there are gradient computation issues
-            critic_parameters = [param for name, param in self.critic.named_parameters() if "features_extractor" not in name]
+            critic_parameters = [param for name, param in self.critic.named_parameters() if
+                                 "features_extractor" not in name]
         else:
             # Create a separate features extractor for the critic
             # this requires more memory and computation
             self.critic = self.make_critic(features_extractor=None)
             critic_parameters = self.critic.parameters()
 
-        # Critic target should not share the features extractor with critic
-        self.critic_target = self.make_critic(features_extractor=None)
+        # It is OK to use the same features extractor as long as it is an instance of FlattenExtractor
+        self.critic_target = self.make_critic(features_extractor=self.actor.features_extractor)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
         self.critic.optimizer = self.optimizer_class(critic_parameters, lr=lr_schedule(1), **self.optimizer_kwargs)
@@ -849,7 +868,8 @@ class SACWMPolicy(BasePolicy):
         return self._predict(obs, deterministic=deterministic)
 
     def _predict(self, observation: th.Tensor, deterministic: bool = False) -> th.Tensor:
-        return self.actor(observation, deterministic)
+        features = self.extract_features(observation)
+        return self.actor(features, deterministic)
 
     def set_training_mode(self, mode: bool) -> None:
         """
@@ -861,7 +881,15 @@ class SACWMPolicy(BasePolicy):
         """
         self.actor.set_training_mode(mode)
         self.critic.set_training_mode(mode)
+        self.features_extractor.train(mode)
         self.training = mode
+
+    def extract_features_target(self, obs: th.Tensor) -> th.Tensor:
+        features_extractor = self.features_extractor
+        self.features_extractor = self.features_extractor_target
+        features_target = self.extract_features(obs)
+        self.features_extractor = features_extractor
+        return features_target
 
 
 register_policy("MlpPolicy", MlpPolicy)

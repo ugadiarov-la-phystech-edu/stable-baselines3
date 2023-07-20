@@ -10,7 +10,7 @@ from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import polyak_update
-from stable_baselines3.sac.policies import SACPolicy
+from stable_baselines3.sac.policies import SACPolicy, SACWMPolicy
 
 
 class SAC(OffPolicyAlgorithm):
@@ -317,7 +317,7 @@ class SAC(OffPolicyAlgorithm):
 class SACWM(OffPolicyAlgorithm):
     def __init__(
         self,
-        policy: Union[str, Type[SACPolicy]],
+        policy: Union[str, Type[SACWMPolicy]],
         env: Union[GymEnv, str],
         learning_rate: Union[float, Schedule] = 3e-4,
         buffer_size: int = 1_000_000,  # 1e6
@@ -426,6 +426,8 @@ class SACWM(OffPolicyAlgorithm):
         self.actor = self.policy.actor
         self.critic = self.policy.critic
         self.critic_target = self.policy.critic_target
+        self.features_extractor = self.policy.features_extractor
+        self.features_extractor_target = self.policy.features_extractor_target
 
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
         # Switch to train mode (this affects batch norm / dropout)
@@ -449,8 +451,9 @@ class SACWM(OffPolicyAlgorithm):
             if self.use_sde:
                 self.actor.reset_noise()
 
+            features = self.policy.extract_features(replay_data.observations)
             # Action by the current actor for the sampled state
-            actions_pi, log_prob = self.actor.action_log_prob(replay_data.observations)
+            actions_pi, log_prob = self.actor.action_log_prob(features)
             log_prob = log_prob.reshape(-1, 1)
 
             ent_coef_loss = None
@@ -475,9 +478,11 @@ class SACWM(OffPolicyAlgorithm):
 
             with th.no_grad():
                 # Select action according to policy
-                next_actions, next_log_prob = self.actor.action_log_prob(replay_data.next_observations)
+                next_features_detach = self.policy.extract_features(replay_data.next_observations)
+                next_actions, next_log_prob = self.actor.action_log_prob(next_features_detach)
                 # Compute the next Q values: min over all critics targets
-                next_q_values = th.cat(self.critic_target(replay_data.next_observations, next_actions, self.actor), dim=1)
+                next_features_target = self.policy.extract_features_target(replay_data.next_observations)
+                next_q_values = th.cat(self.critic_target(next_features_target, next_actions, self.actor), dim=1)
                 next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
                 # add entropy term
                 next_q_values = next_q_values - ent_coef * next_log_prob.reshape(-1, 1)
@@ -486,22 +491,24 @@ class SACWM(OffPolicyAlgorithm):
 
             # Get current Q-values estimates for each critic network
             # using action from the replay buffer
-            current_q_values = self.critic(replay_data.observations, replay_data.actions, self.actor)
+            features_detach = features.detach()
+            current_q_values = self.critic(features_detach, replay_data.actions, self.actor)
 
             # Compute critic loss
             q_loss = 0.5 * sum([F.mse_loss(current_q, target_q_values) for current_q in current_q_values])
             q_losses.append(q_loss.item())
 
-            with th.set_grad_enabled(not self.critic.share_features_extractor):
-                states = self.critic.extract_features(replay_data.observations)
-                next_states = self.critic.extract_features(replay_data.next_observations)
-
-            next_states_predictions = [transition_model(states, replay_data.actions) for transition_model in self.critic.transition_models]
-            transition_loss = 0.5 * sum([F.mse_loss(next_states_prediction, next_states) for next_states_prediction in next_states_predictions])
+            next_features_predictions = [transition_model(features_detach, replay_data.actions) for transition_model in
+                                         self.critic.transition_models]
+            transition_loss = 0.5 * sum(
+                [F.mse_loss(next_features_prediction, next_features_detach) for next_features_prediction in
+                 next_features_predictions])
             transition_losses.append(transition_loss.item())
 
-            rewards_predictions = [reward_model(states, replay_data.actions) for reward_model in self.critic.reward_models]
-            reward_loss = 0.5 * sum([F.mse_loss(rewards_prediction, replay_data.rewards) for rewards_prediction in rewards_predictions])
+            rewards_predictions = [reward_model(features_detach, replay_data.actions) for reward_model in
+                                   self.critic.reward_models]
+            reward_loss = 0.5 * sum(
+                [F.mse_loss(rewards_prediction, replay_data.rewards) for rewards_prediction in rewards_predictions])
             reward_losses.append(reward_loss.item())
 
             critic_loss = q_loss + self.transition_loss_coef * transition_loss + self.reward_loss_coef * reward_loss
@@ -515,7 +522,7 @@ class SACWM(OffPolicyAlgorithm):
             # Compute actor loss
             # Alternative: actor_loss = th.mean(log_prob - qf1_pi)
             # Mean over all critic networks
-            q_values_pi = th.cat(self.critic(replay_data.observations, actions_pi, self.actor), dim=1)
+            q_values_pi = th.cat(self.critic(features, actions_pi, self.actor), dim=1)
             min_qf_pi, _ = th.min(q_values_pi, dim=1, keepdim=True)
             actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
             actor_losses.append(actor_loss.item())
@@ -528,6 +535,8 @@ class SACWM(OffPolicyAlgorithm):
             # Update target networks
             if gradient_step % self.target_update_interval == 0:
                 polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
+                polyak_update(self.features_extractor.parameters(), self.features_extractor_target.parameters(),
+                              self.tau)
 
         self._n_updates += gradient_steps
 
