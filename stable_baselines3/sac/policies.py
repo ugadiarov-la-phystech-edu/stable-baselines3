@@ -915,7 +915,7 @@ class ContinuousCriticWM_GNN(BaseModel):
         transition_model,
         reward_model,
         value_model,
-        termination_model,
+        termination_model=None,
         n_critics: int = 1,
         gamma: float = 0.99,
         depth: int = 1,
@@ -961,7 +961,9 @@ class ContinuousCriticWM_GNN(BaseModel):
 
             q_value = value_model([states[self.depth], actions[-1], moving_boxes, False])
             for i in range(self.depth - 1, -1, -1):
-                termination = th.sigmoid(self.termination_model([states[i + 1], actions[-1], moving_boxes, False]))
+                termination = 0
+                if self.termination_model is not None:
+                    termination = th.sigmoid(self.termination_model([states[i + 1], actions[-1], moving_boxes, False]))
                 q_value = reward_model([states[i], actions[i], moving_boxes, False]) + self.gamma * (1 - termination) * q_value
             q_values.append(q_value)
 
@@ -981,7 +983,9 @@ class ContinuousCriticWM_GNN(BaseModel):
 
         q_value = value_model([states[self.depth], actions[-1], moving_boxes, False])
         for i in range(self.depth - 1, -1, -1):
-            termination = th.sigmoid(self.termination_model([states[i + 1], actions[-1], moving_boxes, False]))
+            termination = 0
+            if self.termination_model is not None:
+                termination = th.sigmoid(self.termination_model([states[i + 1], actions[-1], moving_boxes, False]))
             q_value = reward_model([states[i], actions[i], moving_boxes, False]) + self.gamma * (1 - termination) * q_value
 
         return q_value
