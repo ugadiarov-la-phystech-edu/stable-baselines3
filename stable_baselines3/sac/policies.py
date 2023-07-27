@@ -1,3 +1,4 @@
+import copy
 import warnings
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
@@ -18,6 +19,7 @@ from stable_baselines3.common.torch_layers import (
     get_actor_critic_arch,
 )
 from stable_baselines3.common.type_aliases import Schedule
+from stable_baselines3.sac.cswm import TransitionGNN
 
 # CAP the standard deviation of the actor
 LOG_STD_MAX = 2
@@ -541,6 +543,68 @@ class TransitionModel(BaseModel):
         return self.network(states_actions) + states
 
 
+class TransitionModelGNN(BaseModel):
+    def __init__(
+            self,
+            observation_space: gym.spaces.Space,
+            action_space: gym.spaces.Space,
+            embedding_dim,
+            hidden_dim,
+            num_objects,
+            ignore_action,
+            copy_action,
+            use_interactions,
+            edge_actions
+    ):
+        super().__init__(
+            observation_space,
+            action_space,
+            features_extractor=None,
+            normalize_images=False,
+        )
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
+        self.num_objects = num_objects
+        self.ignore_action = ignore_action
+        self.copy_action = copy_action
+        self.use_interactions = use_interactions
+        self.edge_actions = edge_actions
+        self.network = TransitionGNN(input_dim=self.embedding_dim, hidden_dim=self.hidden_dim,
+                                     action_dim=self.action_space.shape[0], num_objects=self.num_objects,
+                                     ignore_action=self.ignore_action, copy_action=self.copy_action,
+                                     use_interactions=self.use_interactions, edge_actions=self.edge_actions)
+
+    def forward(self, embedding_action_boxes_viz):
+        return self.network(embedding_action_boxes_viz)[0] + embedding_action_boxes_viz[0]
+
+    def _update_features_extractor(
+            self,
+            net_kwargs: Dict[str, Any],
+            features_extractor: Optional[BaseFeaturesExtractor] = None,
+    ) -> Dict[str, Any]:
+        raise NotImplementedError()
+
+    def make_features_extractor(self) -> BaseFeaturesExtractor:
+        raise NotImplementedError()
+
+    def extract_features(self, obs: th.Tensor) -> th.Tensor:
+        raise NotImplementedError()
+
+    def _get_constructor_parameters(self) -> Dict[str, Any]:
+        return dict(
+            observation_space=self.observation_space,
+            action_space=self.action_space,
+            normalize_images=self.normalize_images,
+            embedding_dim=self.embedding_dim,
+            hidden_dim=self.hidden_dim,
+            num_objects=self.num_objects,
+            ignore_action=self.ignore_action,
+            copy_action=self.copy_action,
+            use_interactions=self.use_interactions,
+            edge_actions=self.edge_actions
+        )
+
+
 class RewardModel(BaseModel):
     def __init__(
         self,
@@ -565,6 +629,69 @@ class RewardModel(BaseModel):
         return self.network(states_actions)
 
 
+class RewardModelGNN(BaseModel):
+    def __init__(
+        self,
+        observation_space: gym.spaces.Space,
+        action_space: gym.spaces.Space,
+        embedding_dim,
+        hidden_dim,
+        num_objects,
+        ignore_action,
+        copy_action,
+        use_interactions,
+        edge_actions
+    ):
+        super().__init__(
+            observation_space,
+            action_space,
+            features_extractor=None,
+            normalize_images=False,
+        )
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
+        self.num_objects = num_objects
+        self.ignore_action = ignore_action
+        self.copy_action = copy_action
+        self.use_interactions = use_interactions
+        self.edge_actions = edge_actions
+        self.gnn = TransitionGNN(input_dim=self.embedding_dim, hidden_dim=self.hidden_dim,
+                                 action_dim=self.action_space.shape[0], num_objects=self.num_objects,
+                                 ignore_action=False, copy_action=True, act_fn='relu', layer_norm=True, num_layers=3,
+                                 use_interactions=True, edge_actions=True)
+        self.mlp = nn.Linear(self.embedding_dim, 1)
+
+    def forward(self, embedding_action_boxes_viz):
+        return self.mlp(self.gnn(embedding_action_boxes_viz)[0].mean(dim=1)).squeeze(dim=1)
+
+    def _update_features_extractor(
+        self,
+        net_kwargs: Dict[str, Any],
+        features_extractor: Optional[BaseFeaturesExtractor] = None,
+    ) -> Dict[str, Any]:
+        raise NotImplementedError()
+
+    def make_features_extractor(self) -> BaseFeaturesExtractor:
+        raise NotImplementedError()
+
+    def extract_features(self, obs: th.Tensor) -> th.Tensor:
+        raise NotImplementedError()
+
+    def _get_constructor_parameters(self) -> Dict[str, Any]:
+        return dict(
+            observation_space=self.observation_space,
+            action_space=self.action_space,
+            normalize_images=self.normalize_images,
+            embedding_dim=self.embedding_dim,
+            hidden_dim=self.hidden_dim,
+            num_objects=self.num_objects,
+            ignore_action=self.ignore_action,
+            copy_action=self.copy_action,
+            use_interactions=self.use_interactions,
+            edge_actions=self.edge_actions
+        )
+
+
 class ValueModel(BaseModel):
     def __init__(
         self,
@@ -585,6 +712,114 @@ class ValueModel(BaseModel):
 
     def forward(self, states: th.Tensor) -> Tuple[th.Tensor, ...]:
         return self.network(states)
+
+
+class ValueModelGNN(BaseModel):
+    def __init__(
+        self,
+        observation_space: gym.spaces.Space,
+        embedding_dim,
+        hidden_dim,
+        num_objects,
+        use_interactions,
+    ):
+        super().__init__(
+            observation_space,
+            None,
+            features_extractor=None,
+            normalize_images=False,
+        )
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
+        self.num_objects = num_objects
+        self.use_interactions = use_interactions
+        self.network = TransitionGNN(input_dim=self.embedding_dim, hidden_dim=self.hidden_dim,
+                                     action_dim=0, num_objects=self.num_objects,
+                                     ignore_action=True, copy_action=False,
+                                     use_interactions=self.use_interactions, edge_actions=False,)
+        self.mlp = nn.Linear(self.embedding_dim, 1)
+
+    def forward(self, embedding_action_boxes_viz):
+        gnn_output = self.network(embedding_action_boxes_viz)[0].mean(dim=1)
+        return self.mlp(gnn_output).squeeze(dim=1)
+
+    def _update_features_extractor(
+        self,
+        net_kwargs: Dict[str, Any],
+        features_extractor: Optional[BaseFeaturesExtractor] = None,
+    ) -> Dict[str, Any]:
+        raise NotImplementedError()
+
+    def make_features_extractor(self) -> BaseFeaturesExtractor:
+        raise NotImplementedError()
+
+    def extract_features(self, obs: th.Tensor) -> th.Tensor:
+        raise NotImplementedError()
+
+    def _get_constructor_parameters(self) -> Dict[str, Any]:
+        return dict(
+            observation_space=self.observation_space,
+            action_space=self.action_space,
+            normalize_images=self.normalize_images,
+            embedding_dim=self.embedding_dim,
+            hidden_dim=self.hidden_dim,
+            num_objects=self.num_objects,
+            use_interactions=self.use_interactions,
+        )
+
+
+class TerminationModelGNN(BaseModel):
+    def __init__(
+        self,
+        observation_space: gym.spaces.Space,
+        embedding_dim,
+        hidden_dim,
+        num_objects,
+        use_interactions,
+    ):
+        super().__init__(
+            observation_space,
+            None,
+            features_extractor=None,
+            normalize_images=False,
+        )
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
+        self.num_objects = num_objects
+        self.use_interactions = use_interactions
+        self.gnn = TransitionGNN(input_dim=self.embedding_dim, hidden_dim=self.hidden_dim,
+                                 action_dim=0, num_objects=self.num_objects,
+                                 ignore_action=True, copy_action=False,
+                                 use_interactions=self.use_interactions, edge_actions=False,)
+        self.mlp = nn.Linear(self.embedding_dim, 1)
+
+    def forward(self, embedding_action_boxes_viz):
+        gnn_output = self.gnn(embedding_action_boxes_viz)[0].mean(dim=1)
+        return self.mlp(gnn_output).squeeze(dim=1)
+
+    def _update_features_extractor(
+        self,
+        net_kwargs: Dict[str, Any],
+        features_extractor: Optional[BaseFeaturesExtractor] = None,
+    ) -> Dict[str, Any]:
+        raise NotImplementedError()
+
+    def make_features_extractor(self) -> BaseFeaturesExtractor:
+        raise NotImplementedError()
+
+    def extract_features(self, obs: th.Tensor) -> th.Tensor:
+        raise NotImplementedError()
+
+    def _get_constructor_parameters(self) -> Dict[str, Any]:
+        return dict(
+            observation_space=self.observation_space,
+            action_space=self.action_space,
+            normalize_images=self.normalize_images,
+            embedding_dim=self.embedding_dim,
+            hidden_dim=self.hidden_dim,
+            num_objects=self.num_objects,
+            use_interactions=self.use_interactions,
+        )
 
 
 class ContinuousCriticWM(BaseModel):
@@ -672,6 +907,185 @@ class ContinuousCriticWM(BaseModel):
             q_value = reward_model(states[i], actions[i]) + self.gamma * q_value
 
         return q_value
+
+
+class ContinuousCriticWM_GNN(BaseModel):
+    def __init__(
+        self,
+        transition_model,
+        reward_model,
+        value_model,
+        termination_model,
+        n_critics: int = 1,
+        gamma: float = 0.99,
+        depth: int = 1,
+    ):
+        super().__init__(
+            None,
+            None,
+            features_extractor=None,
+            normalize_images=False,
+        )
+
+        self.gamma = gamma
+        self.depth = depth
+        self.n_critics = n_critics
+        self.transition_model = transition_model
+        self.reward_model = reward_model
+        self.value_models = nn.ModuleList()
+        self.value_models.append(value_model)
+        self.termination_model = termination_model
+
+        def reinit(layer):
+            if hasattr(layer, 'reset_parameters'):
+                layer.reset_parameters()
+
+        for _ in range(self.n_critics - 1):
+            value_model_copy = copy.deepcopy(value_model)
+            value_model_copy.apply(reinit)
+            self.value_models.append(value_model_copy)
+
+    def forward(self, embedding: th.Tensor, action: th.Tensor, moving_boxes: th.Tensor, actor: Actor) -> Tuple[th.Tensor, ...]:
+        q_values = []
+        for critic_id in range(self.n_critics):
+            transition_model = self.transition_model
+            reward_model = self.reward_model
+            value_model = self.value_models[critic_id]
+            states = [embedding]
+            actions = [action]
+            for _ in range(self.depth):
+                next_state = transition_model([states[-1], actions[-1], moving_boxes, False])
+                next_action = actor([next_state, actions[-1], moving_boxes, False])
+                states.append(next_state)
+                actions.append(next_action)
+
+            q_value = value_model([states[self.depth], actions[-1], moving_boxes, False])
+            for i in range(self.depth - 1, -1, -1):
+                termination = th.sigmoid(self.termination_model([states[i + 1], actions[-1], moving_boxes, False]))
+                q_value = reward_model([states[i], actions[i], moving_boxes, False]) + self.gamma * (1 - termination) * q_value
+            q_values.append(q_value)
+
+        return tuple(q_values)
+
+    def q1_forward(self, embedding: th.Tensor, actions: th.Tensor, moving_boxes: th.Tensor, actor: Actor) -> th.Tensor:
+        transition_model = self.transition_model
+        reward_model = self.reward_model
+        value_model = self.value_models[0]
+        states = [embedding]
+        actions = [actions]
+        for _ in range(self.depth):
+            next_state = transition_model([states[-1], actions[-1], moving_boxes, False])
+            next_action = actor([next_state, actions[-1], moving_boxes, False])
+            states.append(next_state)
+            actions.append(next_action)
+
+        q_value = value_model([states[self.depth], actions[-1], moving_boxes, False])
+        for i in range(self.depth - 1, -1, -1):
+            termination = th.sigmoid(self.termination_model([states[i + 1], actions[-1], moving_boxes, False]))
+            q_value = reward_model([states[i], actions[i], moving_boxes, False]) + self.gamma * (1 - termination) * q_value
+
+        return q_value
+
+
+class ActorGNN(BasePolicy):
+    def __init__(
+        self,
+        observation_space: gym.spaces.Space,
+        action_space: gym.spaces.Space,
+        embedding_dim,
+        hidden_dim,
+        num_objects,
+        use_interactions,
+    ):
+        super(ActorGNN, self).__init__(
+            observation_space,
+            action_space,
+            features_extractor=False,
+            normalize_images=False,
+            squash_output=True,
+        )
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
+        self.num_objects = num_objects
+        self.use_interactions = use_interactions
+
+        action_dim = get_action_dim(self.action_space)
+        self.latent_pi = TransitionGNN(input_dim=self.embedding_dim, hidden_dim=self.hidden_dim,
+                                       action_dim=0, num_objects=self.num_objects,
+                                       ignore_action=True, copy_action=False,
+                                       use_interactions=self.use_interactions, edge_actions=False,)
+        last_layer_dim = self.embedding_dim
+        self.action_dist = SquashedDiagGaussianDistribution(action_dim)
+        self.mu = nn.Linear(last_layer_dim, action_dim)
+        self.log_std = nn.Linear(last_layer_dim, action_dim)
+
+    def _get_constructor_parameters(self) -> Dict[str, Any]:
+        data = super()._get_constructor_parameters()
+
+        data.update(
+            dict(
+                squash_output=self.squash_output,
+                embedding_dim=self.embedding_dim,
+                num_objects=self.num_objects,
+                hidden_dim=self.hidden_dim,
+                use_interactions=self.use_interactions,
+            )
+        )
+        return data
+
+    def get_std(self) -> th.Tensor:
+        raise NotImplementedError()
+
+    def reset_noise(self, batch_size: int = 1) -> None:
+        raise NotImplementedError()
+
+    def get_action_dist_params(self, embed_action_boxes_viz) -> Tuple[th.Tensor, th.Tensor, Dict[str, th.Tensor]]:
+        latent_pi = self.latent_pi(embed_action_boxes_viz)[0].squeeze(-1).mean(-2)
+        mean_actions = self.mu(latent_pi)
+
+        # Unstructured exploration (Original implementation)
+        log_std = self.log_std(latent_pi)
+        # Original Implementation to cap the standard deviation
+        log_std = th.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
+        return mean_actions, log_std, {}
+
+    def forward(self, embed_action_boxes_viz, deterministic: bool = False) -> th.Tensor:
+        mean_actions, log_std, kwargs = self.get_action_dist_params(embed_action_boxes_viz)
+        # Note: the action is squashed
+        return self.action_dist.actions_from_params(mean_actions, log_std, deterministic=deterministic, **kwargs)
+
+    def action_log_prob(self, embed_action_boxes_viz) -> Tuple[th.Tensor, th.Tensor]:
+        mean_actions, log_std, kwargs = self.get_action_dist_params(embed_action_boxes_viz)
+        # return action and associated log prob
+        return self.action_dist.log_prob_from_params(mean_actions, log_std, **kwargs)
+
+    def _predict(self, embed_action_boxes_viz, deterministic: bool = False) -> th.Tensor:
+        return self(embed_action_boxes_viz, deterministic)
+
+    def predict(
+        self,
+        embed_action_boxes_viz,
+        state: Optional[Tuple[np.ndarray, ...]] = None,
+        episode_start: Optional[np.ndarray] = None,
+        deterministic: bool = False,
+    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
+        self.set_training_mode(False)
+
+        with th.no_grad():
+            actions = self._predict(embed_action_boxes_viz, deterministic=deterministic)
+        # Convert to numpy
+        actions = actions.cpu().numpy()
+
+        if isinstance(self.action_space, gym.spaces.Box):
+            if self.squash_output:
+                # Rescale to proper domain when using squashing
+                actions = self.unscale_action(actions)
+            else:
+                # Actions could be on arbitrary scale, so clip the actions to avoid
+                # out of bound error (e.g. if sampling from a Gaussian distribution)
+                actions = np.clip(actions, self.action_space.low, self.action_space.high)
+
+        return actions, state
 
 
 class SACWMPolicy(BasePolicy):
@@ -890,6 +1304,83 @@ class SACWMPolicy(BasePolicy):
         features_target = self.extract_features(obs)
         self.features_extractor = features_extractor
         return features_target
+
+
+class SACWMGNNPolicy(BasePolicy):
+    def __init__(
+        self,
+        observation_space: gym.spaces.Space,
+        action_space: gym.spaces.Space,
+        lr: float,
+        features_extractor,
+        actor,
+        critic,
+        optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
+        optimizer_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        super(SACWMGNNPolicy, self).__init__(
+            observation_space,
+            action_space,
+            optimizer_class=optimizer_class,
+            optimizer_kwargs=optimizer_kwargs,
+            squash_output=True,
+        )
+
+        self.features_extractor = features_extractor
+        self.actor = actor
+        self.critic = critic
+        self.lr = lr
+
+        self.actor.optimizer = self.optimizer_class(self.actor.parameters(), lr=self.lr, **self.optimizer_kwargs)
+
+        self.critic_target = copy.deepcopy(self.critic)
+        self.critic_target.load_state_dict(self.critic.state_dict())
+        self.critic_target.set_training_mode(False)
+
+        self.critic.optimizer = self.optimizer_class(self.critic.parameters(), lr=self.lr, **self.optimizer_kwargs)
+
+    def _get_constructor_parameters(self) -> Dict[str, Any]:
+        data = super()._get_constructor_parameters()
+
+        data.update(
+            dict(
+                squash_output=self.squash_output,
+            )
+        )
+        return data
+
+    def reset_noise(self, batch_size: int = 1) -> None:
+        raise NotImplementedError()
+
+    def make_actor(self, features_extractor: Optional[BaseFeaturesExtractor] = None) -> Actor:
+        raise NotImplementedError()
+
+    def make_critic(self, features_extractor: Optional[BaseFeaturesExtractor] = None) -> ContinuousCriticWM:
+        raise NotImplementedError()
+
+    def forward(self, embed_action_boxes_viz, deterministic: bool = False) -> th.Tensor:
+        return self._predict(embed_action_boxes_viz, deterministic=deterministic)
+
+    def extract_features(self, obs: th.Tensor) -> th.Tensor:
+        return self.features_extractor(obs.to(self.device) / 255.)
+
+    def _predict(self, embed_action_boxes_viz, deterministic: bool = False) -> th.Tensor:
+        return self.actor(embed_action_boxes_viz, deterministic)
+
+    def set_training_mode(self, mode: bool) -> None:
+        """
+        Put the policy in either training or evaluation mode.
+
+        This affects certain modules, such as batch normalisation and dropout.
+
+        :param mode: if true, set to training mode, else set to evaluation mode
+        """
+        self.actor.set_training_mode(mode)
+        self.critic.set_training_mode(mode)
+        self.training = mode
+
+    def extract_features_target(self, obs: th.Tensor) -> th.Tensor:
+        return self.extract_features(obs)
 
 
 register_policy("MlpPolicy", MlpPolicy)

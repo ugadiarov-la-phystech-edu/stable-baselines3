@@ -1,3 +1,4 @@
+import cv2
 import gym
 import numpy as np
 from causal_world.configs.world_constants import WorldConstants
@@ -46,6 +47,8 @@ def CwTargetEnv(config, seed):
         elif config.render_mode == "state":
             obs_key = "gt"
         env = SelectObsKeyWrapper(env, obs_key=obs_key)
+        if config.object_wise:
+            env = ObjectMaskWrapper(env)
 
     return env
 
@@ -169,8 +172,8 @@ class SingleFingerCausalWorldWrapper(gym.Wrapper):
 
     def _get_target_obj_index(self):
         if self._config.mode == "casual":
-            if self._persistent_target_idx is None:
-                self._persistent_target_idx = np.random.randint(self.num_objects)
+            assert self._config.target_idx is not None
+            self._persistent_target_idx = self._config.target_idx
             return self._persistent_target_idx
         return np.random.randint(self.num_objects)
 
@@ -194,18 +197,30 @@ class SingleFingerCausalWorldWrapper(gym.Wrapper):
             raise NotImplementedError()
 
         if self._config.task == "target":
-            for n_idx in range(self.num_objects):
-                if n_idx == self.target_obj_idx:
-                    color = self._target_color
-                else:
-                    found = False
-                    while not found:
-                        color = np.random.choice(self._COLORS)
-                        found = color != self._target_color
+            interventions[f"obj_{self.target_obj_idx}"] = {
+                "color": colors.to_rgb(self._target_color),
+                "cylindrical_position": positions[self.target_obj_idx],
+                "size": np.asarray(self._size),
+            }
 
-                interventions[f"obj_{n_idx}"] = {
-                    "color": colors.to_rgb(color),
-                    "cylindrical_position": positions[n_idx],
+            obj_indices = set(range(self.num_objects))
+            obj_indices.remove(self.target_obj_idx)
+            obj_indices = sorted(obj_indices)
+
+            free_colors = set(self._COLORS)
+            free_colors.remove(self._target_color)
+            free_colors = sorted(free_colors)
+
+            if self._config.unique_colors:
+                assert self.num_objects == len(self._COLORS)
+                color_indices = np.random.choice(len(free_colors), size=len(free_colors), replace=False)
+            else:
+                color_indices = np.random.choice(len(free_colors), size=len(free_colors), replace=True)
+
+            for obj_id, color_id in zip(obj_indices, color_indices):
+                interventions[f"obj_{obj_id}"] = {
+                    "color": colors.to_rgb(free_colors[color_id]),
+                    "cylindrical_position": positions[obj_id],
                     "size": np.asarray(self._size),
                 }
         if self._config.task == "ooo":
@@ -247,6 +262,55 @@ class SelectObsKeyWrapper(gym.ObservationWrapper):
 
     def observation(self, obs):
         return obs[self.obs_key]
+
+
+class ObjectMaskWrapper(gym.Wrapper):
+    def __init__(self, env, shape=(64, 64)):
+        super().__init__(env)
+        self._shape = shape
+        self._orange = (38, 39)
+        self._cyan = (179, 181)
+        self._violet = (299, 301)
+        self._yellow = (59, 61)
+        self._green = (119, 121)
+        self._current_image = None
+        self.observation_space = gym.spaces.Box(low=0, high=255, shape=(6, *self._shape), dtype=np.uint8)
+
+    def get_current_image(self):
+        return self._current_image
+
+    @staticmethod
+    def _extract_mask(image_hls, hue_range):
+        return (image_hls[..., 0] < hue_range[1]) & (image_hls[..., 0] > hue_range[0])
+
+    def _resize(self, image):
+        return cv2.resize(image, dsize=self._shape, interpolation=cv2.INTER_AREA)
+
+    def _process_image(self, image):
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        hls = cv2.cvtColor(image.astype(np.float32) / 255., cv2.COLOR_RGB2HLS)
+
+        orange = self._extract_mask(hls, self._orange)
+        cyan = self._extract_mask(hls, self._cyan)
+        violet = self._extract_mask(hls, self._violet)
+        yellow = self._extract_mask(hls, self._yellow)
+        green = self._extract_mask(hls, self._green)
+        background = ~(orange | cyan | violet | yellow | green)
+
+        images = [violet, orange, cyan, yellow, green, background]
+        images = [self._resize(mask * gray) for mask in images]
+
+        return np.asarray(images)
+
+    def reset(self, **kwargs):
+        self.env.reset()
+        self._current_image = self.env.render()
+        return self._process_image(self._current_image)
+
+    def step(self, action):
+        observation, reward, done, info = self.env.step(action)
+        self._current_image = self.env.render()
+        return self._process_image(self._current_image), reward, done, info
 
 
 class CausalRLRenderWrapper(gym.Wrapper):
