@@ -47,8 +47,8 @@ def CwTargetEnv(config, seed):
         elif config.render_mode == "state":
             obs_key = "gt"
         env = SelectObsKeyWrapper(env, obs_key=obs_key)
-        if config.object_wise:
-            env = ObjectMaskWrapper(env)
+        if config.object_wise is not None:
+            env = ObjectMaskWrapper(env, kind=config.object_wise)
 
     return env
 
@@ -265,29 +265,44 @@ class SelectObsKeyWrapper(gym.ObservationWrapper):
 
 
 class ObjectMaskWrapper(gym.Wrapper):
-    def __init__(self, env, shape=(64, 64)):
+    def __init__(self, env, shape=(64, 64), kind='gray'):
         super().__init__(env)
+        if kind not in ('gray', 'color'):
+            raise ValueError(f'Unexpected object mask type: {kind}')
+
         self._shape = shape
+        self._kind = kind
         self._orange = (38, 39)
         self._cyan = (179, 181)
         self._violet = (299, 301)
         self._yellow = (59, 61)
         self._green = (119, 121)
         self._current_image = None
-        self.observation_space = gym.spaces.Box(low=0, high=255, shape=(6, *self._shape), dtype=np.uint8)
+        n_channels = 6 if self._kind == 'gray' else 18
+        self.observation_space = gym.spaces.Box(low=0, high=255, shape=(n_channels, *self._shape), dtype=np.uint8)
+        self._target_cube_scale = 255
+        self._cube_scale = 128
 
     def get_current_image(self):
         return self._current_image
 
     @staticmethod
     def _extract_mask(image_hls, hue_range):
-        return (image_hls[..., 0] < hue_range[1]) & (image_hls[..., 0] > hue_range[0])
+        mask = (image_hls[..., 0] < hue_range[1]) & (image_hls[..., 0] > hue_range[0])
+        return mask[..., np.newaxis]
 
     def _resize(self, image):
-        return cv2.resize(image, dsize=self._shape, interpolation=cv2.INTER_AREA)
+        image = cv2.resize(image, dsize=self._shape, interpolation=cv2.INTER_AREA)
+        if len(image.shape) == 2:
+            image = image[..., np.newaxis]
+
+        return image
+
+    @staticmethod
+    def _normalize(image, amplitude):
+        return (image / image.max() * amplitude).astype(np.uint8)
 
     def _process_image(self, image):
-        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
         hls = cv2.cvtColor(image.astype(np.float32) / 255., cv2.COLOR_RGB2HLS)
 
         orange = self._extract_mask(hls, self._orange)
@@ -297,10 +312,17 @@ class ObjectMaskWrapper(gym.Wrapper):
         green = self._extract_mask(hls, self._green)
         background = ~(orange | cyan | violet | yellow | green)
 
-        images = [violet, orange, cyan, yellow, green, background]
-        images = [self._resize(mask * gray) for mask in images]
+        if self._kind == 'gray':
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)[..., np.newaxis]
 
-        return np.asarray(images)
+        target_cube = self._normalize(self._resize(violet * image), self._target_cube_scale)
+        images = [self._normalize(self._resize(mask * image), self._cube_scale) for mask in (orange, cyan, yellow)]
+
+        images.insert(0, target_cube)
+        images.append(self._resize(green * image))
+        images.append(self._resize(background * image))
+
+        return np.concatenate([np.moveaxis(image, 2, 0) for image in images], axis=0)
 
     def reset(self, **kwargs):
         self.env.reset()

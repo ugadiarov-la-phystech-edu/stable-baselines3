@@ -9,12 +9,12 @@ COLORS:
 - orange
 - yellow
 - cyan
-unique_colors: false
+unique_colors: true
 mode: easy
 rew_type: sparse
 state_size: 40
 render_mode: image
-object_wise: null
+object_wise: gray
 tags: cwtargetN4C4S1S1,easymode,sparserewtype
 num_stacked_obss: 1
 obs_size: 64
