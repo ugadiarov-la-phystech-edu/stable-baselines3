@@ -930,27 +930,35 @@ class ContinuousCriticWM_GNN(BaseModel):
         self.gamma = gamma
         self.depth = depth
         self.n_critics = n_critics
-        self.transition_model = transition_model
-        self.reward_model = reward_model
+        self.transition_models = nn.ModuleList()
+        self.reward_models = nn.ModuleList()
         self.value_models = nn.ModuleList()
+        self.termination_models = None if termination_model is None else nn.ModuleList()
+
+        self.transition_models.append(transition_model)
+        self.reward_models.append(reward_model)
         self.value_models.append(value_model)
-        self.termination_model = termination_model
 
         def reinit(layer):
             if hasattr(layer, 'reset_parameters'):
                 layer.reset_parameters()
 
         for _ in range(self.n_critics - 1):
-            value_model_copy = copy.deepcopy(value_model)
-            value_model_copy.apply(reinit)
-            self.value_models.append(value_model_copy)
+            for models in (self.transition_models, self.reward_models, self.value_models, self.termination_models):
+                if models is None:
+                    continue
+
+                model_copy = copy.deepcopy(models[0])
+                model_copy.apply(reinit)
+                models.append(model_copy)
 
     def forward(self, embedding: th.Tensor, action: th.Tensor, moving_boxes: th.Tensor, actor: Actor) -> Tuple[th.Tensor, ...]:
         q_values = []
         for critic_id in range(self.n_critics):
-            transition_model = self.transition_model
-            reward_model = self.reward_model
+            transition_model = self.transition_models[critic_id]
+            reward_model = self.reward_models[critic_id]
             value_model = self.value_models[critic_id]
+            termination_model = None if self.termination_models is None else self.termination_models[critic_id]
             states = [embedding]
             actions = [action]
             for _ in range(self.depth):
@@ -962,7 +970,7 @@ class ContinuousCriticWM_GNN(BaseModel):
             q_value = value_model([states[self.depth], actions[-1], moving_boxes, False])
             for i in range(self.depth - 1, -1, -1):
                 termination = 0
-                if self.termination_model is not None:
+                if termination_model is not None:
                     termination = th.sigmoid(self.termination_model([states[i + 1], actions[-1], moving_boxes, False]))
                 q_value = reward_model([states[i], actions[i], moving_boxes, False]) + self.gamma * (1 - termination) * q_value
             q_values.append(q_value)
@@ -970,9 +978,10 @@ class ContinuousCriticWM_GNN(BaseModel):
         return tuple(q_values)
 
     def q1_forward(self, embedding: th.Tensor, actions: th.Tensor, moving_boxes: th.Tensor, actor: Actor) -> th.Tensor:
-        transition_model = self.transition_model
-        reward_model = self.reward_model
+        transition_model = self.transition_model[0]
+        reward_model = self.reward_model[0]
         value_model = self.value_models[0]
+        termination_model = None if self.termination_models is None else self.termination_models[0]
         states = [embedding]
         actions = [actions]
         for _ in range(self.depth):
@@ -984,7 +993,7 @@ class ContinuousCriticWM_GNN(BaseModel):
         q_value = value_model([states[self.depth], actions[-1], moving_boxes, False])
         for i in range(self.depth - 1, -1, -1):
             termination = 0
-            if self.termination_model is not None:
+            if termination_model is not None:
                 termination = th.sigmoid(self.termination_model([states[i + 1], actions[-1], moving_boxes, False]))
             q_value = reward_model([states[i], actions[i], moving_boxes, False]) + self.gamma * (1 - termination) * q_value
 
@@ -1321,6 +1330,7 @@ class SACWMGNNPolicy(BasePolicy):
         critic,
         optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        move_channels_axis=False,
     ):
         super(SACWMGNNPolicy, self).__init__(
             observation_space,
@@ -1334,6 +1344,7 @@ class SACWMGNNPolicy(BasePolicy):
         self.actor = actor
         self.critic = critic
         self.lr = lr
+        self.move_channels_axis = move_channels_axis
 
         self.actor.optimizer = self.optimizer_class(self.actor.parameters(), lr=self.lr, **self.optimizer_kwargs)
 
@@ -1366,6 +1377,8 @@ class SACWMGNNPolicy(BasePolicy):
         return self._predict(embed_action_boxes_viz, deterministic=deterministic)
 
     def extract_features(self, obs: th.Tensor) -> th.Tensor:
+        if self.move_channels_axis:
+            obs = th.moveaxis(obs, 3, 1)
         return self.features_extractor(obs.to(self.device) / 255.)
 
     def _predict(self, embed_action_boxes_viz, deterministic: bool = False) -> th.Tensor:
