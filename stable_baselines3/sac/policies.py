@@ -1352,7 +1352,12 @@ class SACWMGNNPolicy(BasePolicy):
         self.critic_target.load_state_dict(self.critic.state_dict())
         self.critic_target.set_training_mode(False)
 
-        self.critic.optimizer = self.optimizer_class(self.critic.parameters(), lr=self.lr, **self.optimizer_kwargs)
+        self.critic.optimizer_wm = self.optimizer_class(
+            [parameter for name, parameter in self.critic.named_parameters() if
+             name.startswith('transition') or name.startswith('reward')], lr=self.lr, **self.optimizer_kwargs)
+        self.critic.optimizer_value = self.optimizer_class(
+            [parameter for name, parameter in self.critic.named_parameters() if name.startswith('value')], lr=self.lr,
+            **self.optimizer_kwargs)
 
     def _get_constructor_parameters(self) -> Dict[str, Any]:
         data = super()._get_constructor_parameters()
