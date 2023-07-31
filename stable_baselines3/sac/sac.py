@@ -620,6 +620,8 @@ class SACWMGNN(OffPolicyAlgorithm):
             seed: Optional[int] = None,
             device: Union[th.device, str] = "auto",
             _init_setup_model: bool = True,
+            transition_loss_coef: float = 1.0,
+            reward_loss_coef: float = 1.0,
     ):
 
         super(SACWMGNN, self).__init__(
@@ -659,6 +661,8 @@ class SACWMGNN(OffPolicyAlgorithm):
         self.ent_coef = ent_coef
         self.target_update_interval = target_update_interval
         self.ent_coef_optimizer = None
+        self.transition_loss_coef = transition_loss_coef
+        self.reward_loss_coef = reward_loss_coef
 
         self.fake_actions = torch.tensor(
             np.zeros((self.batch_size, *self.action_space.shape), dtype=self.action_space.dtype), device=self.device)
@@ -767,7 +771,7 @@ class SACWMGNN(OffPolicyAlgorithm):
         self._update_learning_rate(optimizers)
 
         ent_coef_losses, ent_coefs = [], []
-        actor_losses, q_losses, transition_losses, reward_losses = [], [], [], []
+        actor_losses, q_losses, transition_losses, reward_losses, critic_losses = [], [], [], [], []
 
         for gradient_step in range(gradient_steps):
             # Sample replay buffer
@@ -829,19 +833,22 @@ class SACWMGNN(OffPolicyAlgorithm):
                 [F.mse_loss(current_q, target_q_values.squeeze(dim=1)) for current_q in current_q_values])
             q_losses.append(q_loss.item())
 
-            next_features_prediction = \
-                self.critic.transition_model([features_detach, replay_data.actions, self.moving_boxes, False])
-            transition_loss = F.mse_loss(next_features_prediction, next_features_detach)
+            next_features_predictions = \
+                [transition_model([features_detach, replay_data.actions, self.moving_boxes, False]) for transition_model in self.critic.transition_models]
+            transition_loss = 0.5 * sum([F.mse_loss(next_features_prediction, next_features_detach) for next_features_prediction in next_features_predictions])
             transition_losses.append(transition_loss.item())
 
-            rewards_prediction = \
-                self.critic.reward_model([features_detach, replay_data.actions, self.moving_boxes, False])
-            reward_loss = F.mse_loss(rewards_prediction, replay_data.rewards.squeeze(dim=1))
+            rewards_predictions = \
+                [reward_model([features_detach, replay_data.actions, self.moving_boxes, False]) for reward_model in self.critic.reward_models]
+            reward_loss = 0.5 * sum([F.mse_loss(rewards_prediction, replay_data.rewards.squeeze(dim=1)) for rewards_prediction in rewards_predictions])
             reward_losses.append(reward_loss.item())
+
+            critic_loss = q_loss + self.transition_loss_coef * transition_loss + self.reward_loss_coef * reward_loss
+            critic_losses.append(critic_loss.item())
 
             # Optimize the critic
             self.critic.optimizer.zero_grad()
-            q_loss.backward()
+            critic_loss.backward()
             self.critic.optimizer.step()
 
             # Compute actor loss
@@ -867,6 +874,7 @@ class SACWMGNN(OffPolicyAlgorithm):
         self.logger.record("train/ent_coef", np.mean(ent_coefs))
         self.logger.record("train/actor_loss", np.mean(actor_losses))
         self.logger.record("train/q_loss", np.mean(q_losses))
+        self.logger.record("train/critic_loss", np.mean(critic_losses))
         self.logger.record("train/transition_loss", np.mean(transition_losses))
         self.logger.record("train/reward_loss", np.mean(reward_losses))
         if len(ent_coef_losses) > 0:
