@@ -909,6 +909,41 @@ class ContinuousCriticWM(BaseModel):
         return q_value
 
 
+class ContinuousCriticGNN(BaseModel):
+    def __init__(
+        self,
+        q_model,
+        n_critics: int = 1,
+    ):
+        super().__init__(
+            None,
+            None,
+            features_extractor=None,
+            normalize_images=False,
+        )
+
+        self.n_critics = n_critics
+        self.q_models = nn.ModuleList()
+        self.q_models.append(q_model)
+
+        def reinit(layer):
+            if hasattr(layer, 'reset_parameters'):
+                layer.reset_parameters()
+
+        for _ in range(self.n_critics - 1):
+            q_model_copy = copy.deepcopy(q_model)
+            q_model_copy.apply(reinit)
+            self.q_models.append(q_model_copy)
+
+    def forward(self, embedding: th.Tensor, action: th.Tensor, moving_boxes: th.Tensor, actor: Actor) -> Tuple[th.Tensor, ...]:
+        args = [embedding, action, moving_boxes, False]
+        return tuple(q_model(args) for q_model in self.q_models)
+
+    def q1_forward(self, embedding: th.Tensor, actions: th.Tensor, moving_boxes: th.Tensor, actor: Actor) -> th.Tensor:
+        args = [embedding, actions, moving_boxes, False]
+        return self.q_models[0](args)
+
+
 class ContinuousCriticWM_GNN(BaseModel):
     def __init__(
         self,
