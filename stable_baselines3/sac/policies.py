@@ -658,11 +658,10 @@ class RewardModelGNN(BaseModel):
         self.gnn = TransitionGNN(input_dim=self.embedding_dim, hidden_dim=self.hidden_dim,
                                  action_dim=self.action_space.shape[0], num_objects=self.num_objects,
                                  ignore_action=False, copy_action=True, act_fn='relu', layer_norm=True, num_layers=3,
-                                 use_interactions=True, edge_actions=True)
-        self.mlp = nn.Linear(self.embedding_dim, 1)
+                                 use_interactions=True, edge_actions=True, output_dim=1,)
 
     def forward(self, embedding_action_boxes_viz):
-        return self.mlp(self.gnn(embedding_action_boxes_viz)[0].mean(dim=1)).squeeze(dim=1)
+        return self.gnn(embedding_action_boxes_viz)[0].sum(dim=1).squeeze(dim=1)
 
     def _update_features_extractor(
         self,
@@ -736,12 +735,10 @@ class ValueModelGNN(BaseModel):
         self.network = TransitionGNN(input_dim=self.embedding_dim, hidden_dim=self.hidden_dim,
                                      action_dim=0, num_objects=self.num_objects,
                                      ignore_action=True, copy_action=False,
-                                     use_interactions=self.use_interactions, edge_actions=False,)
-        self.mlp = nn.Linear(self.embedding_dim, 1)
+                                     use_interactions=self.use_interactions, edge_actions=False, output_dim=1,)
 
     def forward(self, embedding_action_boxes_viz):
-        gnn_output = self.network(embedding_action_boxes_viz)[0].mean(dim=1)
-        return self.mlp(gnn_output).squeeze(dim=1)
+        return self.network(embedding_action_boxes_viz)[0].sum(dim=1).squeeze(dim=1)
 
     def _update_features_extractor(
         self,
