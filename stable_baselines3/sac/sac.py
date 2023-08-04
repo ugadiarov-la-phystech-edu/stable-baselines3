@@ -763,7 +763,7 @@ class SACWMGNN(OffPolicyAlgorithm):
         # Switch to train mode (this affects batch norm / dropout)
         self.policy.set_training_mode(True)
         # Update optimizers learning rate
-        optimizers = [self.actor.optimizer, self.critic.optimizer]
+        optimizers = [self.actor.optimizer, self.critic.optimizer_wm, self.critic.optimizer_value]
         if self.ent_coef_optimizer is not None:
             optimizers += [self.ent_coef_optimizer]
 
@@ -771,7 +771,7 @@ class SACWMGNN(OffPolicyAlgorithm):
         self._update_learning_rate(optimizers)
 
         ent_coef_losses, ent_coefs = [], []
-        actor_losses, q_losses, transition_losses, reward_losses, critic_losses = [], [], [], [], []
+        actor_losses, q_losses, transition_losses, reward_losses, wm_losses = [], [], [], [], []
 
         for gradient_step in range(gradient_steps):
             # Sample replay buffer
@@ -843,13 +843,17 @@ class SACWMGNN(OffPolicyAlgorithm):
             reward_loss = 0.5 * sum([F.mse_loss(rewards_prediction, replay_data.rewards.squeeze(dim=1)) for rewards_prediction in rewards_predictions])
             reward_losses.append(reward_loss.item())
 
-            critic_loss = q_loss + self.transition_loss_coef * transition_loss + self.reward_loss_coef * reward_loss
-            critic_losses.append(critic_loss.item())
+            wm_loss = self.transition_loss_coef * transition_loss + self.reward_loss_coef * reward_loss
+            wm_losses.append(wm_loss.item())
 
             # Optimize the critic
-            self.critic.optimizer.zero_grad()
-            critic_loss.backward()
-            self.critic.optimizer.step()
+            self.critic.optimizer_value.zero_grad()
+            q_loss.backward()
+            self.critic.optimizer_value.step()
+
+            self.critic.optimizer_wm.zero_grad()
+            wm_loss.backward()
+            self.critic.optimizer_wm.step()
 
             # Compute actor loss
             # Alternative: actor_loss = th.mean(log_prob - qf1_pi)
@@ -874,7 +878,7 @@ class SACWMGNN(OffPolicyAlgorithm):
         self.logger.record("train/ent_coef", np.mean(ent_coefs))
         self.logger.record("train/actor_loss", np.mean(actor_losses))
         self.logger.record("train/q_loss", np.mean(q_losses))
-        self.logger.record("train/critic_loss", np.mean(critic_losses))
+        self.logger.record("train/wm_loss", np.mean(wm_losses))
         self.logger.record("train/transition_loss", np.mean(transition_losses))
         self.logger.record("train/reward_loss", np.mean(reward_losses))
         if len(ent_coef_losses) > 0:
@@ -922,7 +926,7 @@ class SACWMGNN(OffPolicyAlgorithm):
         return super(SACWMGNN, self)._excluded_save_params() + ["actor", "critic", "critic_target"]
 
     def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:
-        state_dicts = ["policy", "actor.optimizer", "critic.optimizer"]
+        state_dicts = ["policy", "actor.optimizer", "critic.optimizer_wm", "critic.optimizer_value"]
         if self.ent_coef_optimizer is not None:
             saved_pytorch_variables = ["log_ent_coef"]
             state_dicts.append("ent_coef_optimizer")
