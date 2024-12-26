@@ -334,7 +334,7 @@ class EpisodicPPO(PPO):
         batch_size: int = 64,
         n_epochs: int = 10,
         gamma: float = 0.99,
-        gae_lambda: float = 0.95,
+        gae_lambda: float = 1.0,
         clip_range: Union[float, Schedule] = 0.2,
         clip_range_vf: Union[None, float, Schedule] = None,
         normalize_advantage: bool = True,
