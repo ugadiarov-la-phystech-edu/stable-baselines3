@@ -318,5 +318,7 @@ class OnPolicyAlgorithm(BaseAlgorithm):
 
     def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:
         state_dicts = ["policy", "policy.optimizer"]
+        if hasattr(self.policy, "scaler"):
+            state_dicts.append("policy.scaler")
 
         return state_dicts, []

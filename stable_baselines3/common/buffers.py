@@ -1,3 +1,4 @@
+import math
 import warnings
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
@@ -982,8 +983,8 @@ class EpisodeBuffer(BaseBuffer):
             self.generator_ready = True
 
         # Return everything, don't create minibatches
-        if batch_size is None:
-            assert False, f'Should make batch from single environment data'
+        if batch_size is None or math.isinf(batch_size):
+            batch_size = buffer_size
 
         start_idx = 0
         while start_idx < buffer_size:
