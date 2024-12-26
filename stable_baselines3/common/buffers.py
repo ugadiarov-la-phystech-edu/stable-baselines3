@@ -837,3 +837,170 @@ class DictRolloutBuffer(RolloutBuffer):
             advantages=self.to_torch(self.advantages[batch_inds].flatten()),
             returns=self.to_torch(self.returns[batch_inds].flatten()),
         )
+
+
+class EpisodeBuffer(BaseBuffer):
+
+    observations: list
+    actions: list
+    rewards: list
+    advantages: list
+    returns: list
+    log_probs: list
+    values: list
+
+    def __init__(
+        self,
+        n_steps: int,
+        observation_space: spaces.Space,
+        action_space: spaces.Space,
+        device: Union[th.device, str] = "auto",
+        gae_lambda: float = 1,
+        gamma: float = 0.99,
+        n_envs: int = 1,
+    ):
+        super().__init__(-1, observation_space, action_space, device, n_envs=n_envs)
+        self.gae_lambda = gae_lambda
+        self.gamma = gamma
+        self.generator_ready = False
+        self.pos = -1
+        self.full = False
+        self.reset()
+
+    def reset(self) -> None:
+        self.observations = [[] for _ in range(self.n_envs)]
+        self.actions = [[] for _ in range(self.n_envs)]
+        self.rewards = [[] for _ in range(self.n_envs)]
+        self.returns = [None for _ in range(self.n_envs)]
+        self.values = [[] for _ in range(self.n_envs)]
+        self.log_probs = [[] for _ in range(self.n_envs)]
+        self.advantages = [None for _ in range(self.n_envs)]
+        self.generator_ready = False
+
+    def size(self) -> int:
+        return sum(len(env_actions) for env_actions in self.actions)
+
+    def compute_returns_and_advantage(self,) -> None:
+        """
+        Post-processing step: compute the lambda-return (TD(lambda) estimate)
+        and GAE(lambda) advantage.
+
+        Uses Generalized Advantage Estimation (https://arxiv.org/abs/1506.02438)
+        to compute the advantage. To obtain Monte-Carlo advantage estimate (A(s) = R - V(S))
+        where R is the sum of discounted reward with value bootstrap
+        (because we don't always have full episode), set ``gae_lambda=1.0`` during initialization.
+
+        The TD(lambda) estimator has also two special cases:
+        - TD(1) is Monte-Carlo estimate (sum of discounted rewards)
+        - TD(0) is one-step estimate with bootstrapping (r_t + gamma * v(s_{t+1}))
+
+        For more information, see discussion in https://github.com/DLR-RM/stable-baselines3/pull/375.
+        """
+        for env_id in range(self.n_envs):
+            values = self.values[env_id]
+            actions = self.actions[env_id]
+            rewards = self.rewards[env_id]
+            assert len(values) == len(actions)
+            assert len(rewards) == len(actions)
+
+            advantages = [None] * len(actions)
+            returns = [None] * len(actions)
+            last_gae_lam = 0
+            next_values = 0
+            for step in reversed(range(len(actions))):
+                delta = rewards[step] + self.gamma * next_values - values[step]
+                last_gae_lam = delta + self.gamma * self.gae_lambda * last_gae_lam
+                advantages[step] = last_gae_lam
+                returns[step] = last_gae_lam + values[step]
+                next_values = values[step]
+
+            self.advantages[env_id] = advantages
+            self.returns[env_id] = returns
+
+    def add(
+        self,
+        obs: np.ndarray,
+        action: np.ndarray,
+        reward: np.ndarray,
+        value: th.Tensor,
+        log_prob: th.Tensor,
+        env_ids,
+    ) -> None:
+        """
+        :param obs: Observation
+        :param action: Action
+        :param reward:
+        :param value: estimated value of the current state
+            following the current policy.
+        :param log_prob: log probability of the action
+            following the current policy.
+        :param env_ids: which environments produced data
+        """
+        if len(log_prob.shape) == 0:
+            # Reshape 0-d tensor to avoid error
+            log_prob = log_prob.reshape(-1, 1)
+
+        # Reshape needed when using multiple envs with discrete observations
+        # as numpy cannot broadcast (n_discrete,) to (n_discrete, 1)
+        if isinstance(self.observation_space, spaces.Discrete):
+            obs = obs.reshape((self.n_envs, *self.obs_shape))
+
+        # Reshape to handle multi-dim and discrete action spaces, see GH #970 #1392
+        action = action.reshape((self.n_envs, self.action_dim))
+
+        for env_id in env_ids:
+            self.observations[env_id].append(obs[env_id])
+            self.actions[env_id].append(action[env_id])
+            self.rewards[env_id].append(reward[env_id])
+            self.values[env_id].append(value[env_id].clone().cpu().numpy().flatten())
+            self.log_probs[env_id].append(log_prob[env_id].clone().cpu().numpy())
+
+    @staticmethod
+    def swap_and_flatten(buffer: list) -> np.ndarray:
+        data = []
+        for env_data in buffer:
+            data.extend(env_data)
+
+        return np.stack(data)
+
+    def get(self, batch_size: Optional[int] = None) -> Generator[RolloutBufferSamples, None, None]:
+        buffer_size = self.size()
+        indices = np.random.permutation(buffer_size)
+        # Prepare the data
+        if not self.generator_ready:
+            _tensor_names = [
+                "observations",
+                "actions",
+                "values",
+                "log_probs",
+                "advantages",
+                "returns",
+            ]
+
+            for tensor in _tensor_names:
+                self.__dict__[tensor] = self.swap_and_flatten(self.__dict__[tensor])
+            self.generator_ready = True
+
+        # Return everything, don't create minibatches
+        if batch_size is None:
+            assert False, f'Should make batch from single environment data'
+
+        start_idx = 0
+        while start_idx < buffer_size:
+            yield self._get_samples(indices[start_idx : start_idx + batch_size])
+            start_idx += batch_size
+
+    def _get_samples(
+            self,
+            batch_inds: np.ndarray,
+            env: Optional[VecNormalize] = None,
+    ) -> RolloutBufferSamples:
+        data = (
+            self.observations[batch_inds],
+            self.actions[batch_inds],
+            self.values[batch_inds].flatten(),
+            self.log_probs[batch_inds].flatten(),
+            self.advantages[batch_inds].flatten(),
+            self.returns[batch_inds].flatten(),
+        )
+        return RolloutBufferSamples(*tuple(map(self.to_torch, data)))
