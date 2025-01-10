@@ -219,7 +219,8 @@ class PPO(OnPolicyAlgorithm):
                     if self.use_sde:
                         self.policy.reset_noise(self.batch_size)
 
-                    values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
+                    policy_result = self.policy.evaluate_actions(rollout_data.observations, actions)
+                    values, log_prob, entropy = policy_result['values'], policy_result['log_probs'], policy_result['entropy']
                     values = values.flatten()
                     # Normalize advantage
                     advantages = rollout_data.advantages
@@ -431,7 +432,8 @@ class EpisodicPPO(PPO):
             with th.no_grad():
                 # Convert to pytorch tensor or to TensorDict
                 obs_tensor = obs_as_tensor(self._last_obs, self.device)
-                actions, values, log_probs = self.policy(obs_tensor)
+                policy_result = self.policy(obs_tensor)
+                actions, values, log_probs = policy_result['actions'], policy_result['values'], policy_result['log_probs']
             actions = actions.cpu().numpy()
 
             # Rescale and perform action
@@ -592,7 +594,8 @@ class PGPPO(PPO):
                     if self.use_sde:
                         self.policy.reset_noise(self.batch_size)
 
-                    values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
+                    policy_result = self.policy.evaluate_actions(rollout_data.observations, actions)
+                    values, log_prob, entropy = policy_result['values'], policy_result['log_probs'], policy_result['entropy']
                     values = values.flatten()
                     # Normalize advantage
                     advantages = rollout_data.advantages

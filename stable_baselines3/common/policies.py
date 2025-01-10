@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
 
+import gymnasium.spaces
 import numpy as np
 import torch as th
 from gymnasium import spaces
@@ -443,6 +444,7 @@ class ActorCriticPolicy(BasePolicy):
         ``th.optim.Adam`` by default
     :param optimizer_kwargs: Additional keyword arguments,
         excluding the learning rate, to pass to the optimizer
+    :param use_q_critic: If True, the critic approximates Q-function (applicable only for discrete action spaces)
     """
 
     def __init__(
@@ -464,6 +466,7 @@ class ActorCriticPolicy(BasePolicy):
         normalize_images: bool = True,
         optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        use_q_critic: Optional[bool] = False,
     ):
         if optimizer_kwargs is None:
             optimizer_kwargs = {}
@@ -528,6 +531,9 @@ class ActorCriticPolicy(BasePolicy):
 
         self.use_sde = use_sde
         self.dist_kwargs = dist_kwargs
+        self.use_q_critic = use_q_critic
+        if self.use_q_critic and not isinstance(self.action_space, gymnasium.spaces.Discrete):
+            raise ValueError(f'q-critic is available for discrete action spaces, action space type: {type(action_space)}')
 
         # Action distribution
         self.action_dist = make_proba_distribution(action_space, use_sde=use_sde, dist_kwargs=dist_kwargs)
@@ -554,6 +560,7 @@ class ActorCriticPolicy(BasePolicy):
                 optimizer_kwargs=self.optimizer_kwargs,
                 features_extractor_class=self.features_extractor_class,
                 features_extractor_kwargs=self.features_extractor_kwargs,
+                use_q_critic=self.use_q_critic,
             )
         )
         return data
@@ -606,7 +613,7 @@ class ActorCriticPolicy(BasePolicy):
         else:
             raise NotImplementedError(f"Unsupported distribution '{self.action_dist}'.")
 
-        self.value_net = nn.Linear(self.mlp_extractor.latent_dim_vf, 1)
+        self.value_net = nn.Linear(self.mlp_extractor.latent_dim_vf, self.action_space.n if self.use_q_critic else 1)
         # Init weights: use orthogonal initialization
         # with small initial weight for the output
         if self.ortho_init:
@@ -654,9 +661,15 @@ class ActorCriticPolicy(BasePolicy):
         values = self.value_net(latent_vf)
         distribution = self._get_action_dist_from_latent(latent_pi)
         actions = distribution.get_actions(deterministic=deterministic)
-        log_prob = distribution.log_prob(actions)
         actions = actions.reshape((-1, *self.action_space.shape))  # type: ignore[misc]
-        return actions, values, log_prob
+        result = {'actions': actions, 'log_probs': distribution.log_prob(actions)}
+        if self.use_q_critic:
+            result['q_values'] = values
+            result['values'] = th.bmm(values.unsqueeze(1), distribution.distribution.probs.unsqueeze(2)).squeeze(dim=(1, 2))
+        else:
+            result['values'] = values
+
+        return result
 
     def extract_features(  # type: ignore[override]
         self, obs: PyTorchObs, features_extractor: Optional[BaseFeaturesExtractor] = None
@@ -736,10 +749,18 @@ class ActorCriticPolicy(BasePolicy):
             latent_pi = self.mlp_extractor.forward_actor(pi_features)
             latent_vf = self.mlp_extractor.forward_critic(vf_features)
         distribution = self._get_action_dist_from_latent(latent_pi)
-        log_prob = distribution.log_prob(actions)
         values = self.value_net(latent_vf)
         entropy = distribution.entropy()
-        return values, log_prob, entropy
+        result = {'entropy': entropy}
+        if self.use_q_critic:
+            result['q_values'] = values
+            result['probs'] = distribution.distribution.probs
+        else:
+            result['values'] = values
+            log_prob = distribution.log_prob(actions)
+            result['log_probs'] = log_prob
+
+        return result
 
     def get_distribution(self, obs: PyTorchObs) -> Distribution:
         """
@@ -761,7 +782,12 @@ class ActorCriticPolicy(BasePolicy):
         """
         features = super().extract_features(obs, self.vf_features_extractor)
         latent_vf = self.mlp_extractor.forward_critic(features)
-        return self.value_net(latent_vf)
+        values = self.value_net(latent_vf)
+        if self.use_q_critic:
+            distribution = self.get_distribution(obs)
+            values = th.sum(values * distribution.distribution.probs, dim=-1)
+
+        return values
 
 
 class ActorCriticCnnPolicy(ActorCriticPolicy):
@@ -794,6 +820,7 @@ class ActorCriticCnnPolicy(ActorCriticPolicy):
         ``th.optim.Adam`` by default
     :param optimizer_kwargs: Additional keyword arguments,
         excluding the learning rate, to pass to the optimizer
+    :param use_q_critic: If True, the critic approximates Q-function (applicable only for discrete action spaces)
     """
 
     def __init__(
@@ -815,6 +842,7 @@ class ActorCriticCnnPolicy(ActorCriticPolicy):
         normalize_images: bool = True,
         optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        use_q_critic: Optional[bool] = False,
     ):
         super().__init__(
             observation_space,
@@ -834,6 +862,7 @@ class ActorCriticCnnPolicy(ActorCriticPolicy):
             normalize_images,
             optimizer_class,
             optimizer_kwargs,
+            use_q_critic,
         )
 
 
@@ -867,6 +896,7 @@ class MultiInputActorCriticPolicy(ActorCriticPolicy):
         ``th.optim.Adam`` by default
     :param optimizer_kwargs: Additional keyword arguments,
         excluding the learning rate, to pass to the optimizer
+    :param use_q_critic: If True, the critic approximates Q-function (applicable only for discrete action spaces)
     """
 
     def __init__(
@@ -888,6 +918,7 @@ class MultiInputActorCriticPolicy(ActorCriticPolicy):
         normalize_images: bool = True,
         optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        use_q_critic: Optional[bool] = False,
     ):
         super().__init__(
             observation_space,
@@ -907,6 +938,7 @@ class MultiInputActorCriticPolicy(ActorCriticPolicy):
             normalize_images,
             optimizer_class,
             optimizer_kwargs,
+            use_q_critic,
         )
 
 
