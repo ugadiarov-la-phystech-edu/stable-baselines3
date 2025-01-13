@@ -316,3 +316,21 @@ def get_actor_critic_arch(net_arch: Union[List[int], Dict[str, List[int]]]) -> T
         assert "qf" in net_arch, "Error: no key 'qf' was provided in net_arch for the critic network"
         actor_arch, critic_arch = net_arch["pi"], net_arch["qf"]
     return actor_arch, critic_arch
+
+
+class Reshape(nn.Module):
+    def __init__(self, shape, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.shape = shape
+
+    def forward(self, x):
+        return x.reshape(-1, *self.shape)
+
+
+class DictOutput(nn.Module):
+    def __init__(self, dict_key, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.dict_key = dict_key
+
+    def forward(self, x):
+        return {self.dict_key: x}

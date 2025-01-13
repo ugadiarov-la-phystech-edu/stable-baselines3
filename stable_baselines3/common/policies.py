@@ -30,6 +30,7 @@ from stable_baselines3.common.torch_layers import (
     MlpExtractor,
     NatureCNN,
     create_mlp,
+    Reshape, DictOutput,
 )
 from stable_baselines3.common.type_aliases import PyTorchObs, Schedule
 from stable_baselines3.common.utils import get_device, is_vectorized_observation, obs_as_tensor
@@ -532,7 +533,7 @@ class ActorCriticPolicy(BasePolicy):
         self.use_sde = use_sde
         self.dist_kwargs = dist_kwargs
         self.use_q_critic = use_q_critic
-        if self.use_q_critic and not isinstance(self.action_space, gymnasium.spaces.Discrete):
+        if self.use_q_critic and not isinstance(self.action_space, (spaces.Discrete, spaces.Box)):
             raise ValueError(f'q-critic is available for discrete action spaces, action space type: {type(action_space)}')
 
         # Action distribution
@@ -613,7 +614,17 @@ class ActorCriticPolicy(BasePolicy):
         else:
             raise NotImplementedError(f"Unsupported distribution '{self.action_dist}'.")
 
-        self.value_net = nn.Linear(self.mlp_extractor.latent_dim_vf, self.action_space.n if self.use_q_critic else 1)
+        if self.use_q_critic:
+            if isinstance(self.action_space, spaces.Box):
+                self.value_net = QuadraticQCritic(self.mlp_extractor.latent_dim_vf, self.action_space,)
+            elif isinstance(self.action_space, spaces.Discrete):
+                self.value_net = nn.Sequential(nn.Linear(self.mlp_extractor.latent_dim_vf, self.action_space.n),
+                                               DictOutput('values'))
+            else:
+                raise ValueError(f'Expected actions space: discrete or continuous. Actual action space: {self.action_space}')
+        else:
+            self.value_net = nn.Sequential(nn.Linear(self.mlp_extractor.latent_dim_vf, 1), DictOutput('values'))
+
         # Init weights: use orthogonal initialization
         # with small initial weight for the output
         if self.ortho_init:
@@ -658,16 +669,30 @@ class ActorCriticPolicy(BasePolicy):
             latent_pi = self.mlp_extractor.forward_actor(pi_features)
             latent_vf = self.mlp_extractor.forward_critic(vf_features)
         # Evaluate the values for the given observations
-        values = self.value_net(latent_vf)
         distribution = self._get_action_dist_from_latent(latent_pi)
         actions = distribution.get_actions(deterministic=deterministic)
         actions = actions.reshape((-1, *self.action_space.shape))  # type: ignore[misc]
         result = {'actions': actions, 'log_probs': distribution.log_prob(actions)}
-        if self.use_q_critic:
+        if self.use_q_critic and isinstance(self.action_space, spaces.Discrete):
+            critic_output = self.value_net(latent_vf)
+            values = critic_output['values']
             result['q_values'] = values
-            result['values'] = th.bmm(values.unsqueeze(1), distribution.distribution.probs.unsqueeze(2)).squeeze(dim=(1, 2))
+            result['values'] = th.bmm(values.unsqueeze(1), distribution.distribution.probs.unsqueeze(2)).squeeze(
+                dim=(1, 2))
+        elif self.use_q_critic and isinstance(self.action_space, spaces.Box):
+            critic_output = self.value_net(latent_vf, actions)
+            values = critic_output['values']
+            result['q_values'] = values
+            A = critic_output['A']
+            B = critic_output['B']
+            mu = distribution.distribution.loc
+            sigma2 = distribution.distribution.scale * distribution.distribution.scale
+            values = th.bmm(th.diagonal(A, dim1=-2, dim2=-1).unsqueeze(1), sigma2.unsqueeze(-1))
+            values += th.bmm(th.bmm(mu.unsqueeze(1), A) + B.unsqueeze(1), mu.unsqueeze(-1))
+            result['values'] = values.squeeze(dim=(1, 2))
         else:
-            result['values'] = values
+            assert not self.use_q_critic
+            result['values'] = self.value_net(latent_vf)['values']
 
         return result
 
@@ -749,13 +774,27 @@ class ActorCriticPolicy(BasePolicy):
             latent_pi = self.mlp_extractor.forward_actor(pi_features)
             latent_vf = self.mlp_extractor.forward_critic(vf_features)
         distribution = self._get_action_dist_from_latent(latent_pi)
-        values = self.value_net(latent_vf)
         entropy = distribution.entropy()
         result = {'entropy': entropy}
         if self.use_q_critic:
-            result['q_values'] = values
-            result['probs'] = distribution.distribution.probs
+            if isinstance(self.action_space, spaces.Discrete):
+                critic_output = self.value_net(latent_vf)
+                values = critic_output['values']
+                result['q_values'] = values
+                result['probs'] = distribution.distribution.probs
+            elif isinstance(self.action_space, spaces.Box):
+                critic_output = self.value_net(latent_vf, actions)
+                result['q_values'] = critic_output['values']
+                A = critic_output['A'].detach()
+                B = critic_output['B'].detach()
+                mu = distribution.distribution.loc
+                sigma2 = distribution.distribution.scale * distribution.distribution.scale
+                values = th.bmm(th.diagonal(A, dim1=-2, dim2=-1).unsqueeze(1), sigma2.unsqueeze(-1))
+                values += th.bmm(th.bmm(mu.unsqueeze(1), A) + B.unsqueeze(1), mu.unsqueeze(-1))
+                result['values'] = values.squeeze(dim=(1, 2))
         else:
+            critic_output = self.value_net(latent_vf)
+            values = critic_output['values']
             result['values'] = values
             log_prob = distribution.log_prob(actions)
             result['log_probs'] = log_prob
@@ -782,10 +821,27 @@ class ActorCriticPolicy(BasePolicy):
         """
         features = super().extract_features(obs, self.vf_features_extractor)
         latent_vf = self.mlp_extractor.forward_critic(features)
-        values = self.value_net(latent_vf)
         if self.use_q_critic:
             distribution = self.get_distribution(obs)
-            values = th.sum(values * distribution.distribution.probs, dim=-1)
+            if isinstance(self.action_space, spaces.Discrete):
+                critic_output = self.value_net(latent_vf)
+                values = critic_output['values']
+                values = th.bmm(values.unsqueeze(1), distribution.distribution.probs.unsqueeze(2))
+            elif isinstance(self.action_space, spaces.Box):
+                actions = distribution.get_actions()
+                actions = actions.reshape((-1, *self.action_space.shape))
+                critic_output = self.value_net(latent_vf, actions)
+                A = critic_output['A']
+                B = critic_output['B']
+                mu = distribution.distribution.loc
+                sigma2 = distribution.distribution.scale * distribution.distribution.scale
+                values = th.bmm(th.diagonal(A, dim1=-2, dim2=-1).unsqueeze(1), sigma2.unsqueeze(-1))
+                values += th.bmm(th.bmm(mu.unsqueeze(1), A) + B.unsqueeze(1), mu.unsqueeze(-1))
+
+            values = values.squeeze(dim=(1, 2))
+        else:
+            critic_output = self.value_net(latent_vf)
+            values = critic_output['values']
 
         return values
 
@@ -1018,3 +1074,33 @@ class ContinuousCritic(BaseModel):
         with th.no_grad():
             features = self.extract_features(obs, self.features_extractor)
         return self.q_networks[0](th.cat([features, actions], dim=1))
+
+
+class QuadraticQCritic(nn.Module):
+    def __init__(self, features_dim, action_space: spaces.Box, net_arch: List[int] = [],
+                 activation_fn: Type[nn.Module] = nn.ReLU):
+        super().__init__()
+        action_dim = get_action_dim(action_space)
+
+        a_net_list = create_mlp(features_dim, action_dim * action_dim, net_arch, activation_fn)
+        a_net_list.append(Reshape(shape=(action_dim, action_dim)))
+        self.a_net = nn.Sequential(*a_net_list)
+
+        b_net_list = create_mlp(features_dim, action_dim, net_arch, activation_fn)
+        self.b_net = nn.Sequential(*b_net_list)
+
+        self.bias = nn.Parameter(th.tensor([0.], dtype=th.float32), requires_grad=True)
+
+    def forward(self, features: th.Tensor, actions: th.Tensor) -> Dict[str, th.Tensor]:
+        A = self.a_net(features)
+        B = self.b_net(features)
+        output = {
+            'A': A,
+            'B': B,
+            'values': th.bmm(
+                actions.unsqueeze(-2),
+                th.bmm(A, actions.unsqueeze(-1)) + B.unsqueeze(-1)).squeeze(dim=(-2, -1))
+            + self.bias,
+        }
+
+        return output
