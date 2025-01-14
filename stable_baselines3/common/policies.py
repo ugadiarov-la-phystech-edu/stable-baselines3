@@ -1080,27 +1080,24 @@ class QuadraticQCritic(nn.Module):
     def __init__(self, features_dim, action_space: spaces.Box, net_arch: List[int] = [],
                  activation_fn: Type[nn.Module] = nn.ReLU):
         super().__init__()
-        action_dim = get_action_dim(action_space)
+        self.action_dim = get_action_dim(action_space)
 
-        a_net_list = create_mlp(features_dim, action_dim * action_dim, net_arch, activation_fn)
-        a_net_list.append(Reshape(shape=(action_dim, action_dim)))
-        self.a_net = nn.Sequential(*a_net_list)
-
-        b_net_list = create_mlp(features_dim, action_dim, net_arch, activation_fn)
-        self.b_net = nn.Sequential(*b_net_list)
-
-        self.bias = nn.Parameter(th.tensor([0.], dtype=th.float32), requires_grad=True)
+        net_list = create_mlp(
+            features_dim, self.action_dim * self.action_dim + self.action_dim + 1, net_arch, activation_fn
+        )
+        self.net = nn.Sequential(*net_list)
 
     def forward(self, features: th.Tensor, actions: th.Tensor) -> Dict[str, th.Tensor]:
-        A = self.a_net(features)
-        B = self.b_net(features)
+        output = self.net(features)
+        C, B, A = output[:, 0], output[:, 1: self.action_dim + 1], output[:, self.action_dim + 1:]
+        A = A.reshape(-1, self.action_dim, self.action_dim)
         output = {
             'A': A,
             'B': B,
             'values': th.bmm(
                 actions.unsqueeze(-2),
                 th.bmm(A, actions.unsqueeze(-1)) + B.unsqueeze(-1)).squeeze(dim=(-2, -1))
-            + self.bias,
+            + C,
         }
 
         return output
