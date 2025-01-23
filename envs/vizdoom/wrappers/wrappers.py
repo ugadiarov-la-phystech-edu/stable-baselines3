@@ -3,6 +3,7 @@ from typing import Union, Callable, Optional, Dict, Any, Type
 import gymnasium as gym
 import numpy as np
 from gymnasium.core import ObsType, WrapperObsType
+from gymnasium.wrappers import TimeLimit
 
 from stable_baselines3.common.atari_wrappers import MaxAndSkipEnv, WarpFrame, ClipRewardEnv
 from stable_baselines3.common.env_util import make_vec_env
@@ -27,6 +28,7 @@ class VizDoomWrapper(gym.Wrapper[np.ndarray, int, np.ndarray, int]):
         frame_skip: int = 4,
         screen_size: int = 84,
         clip_reward: bool = True,
+        time_limit: int = 2099,
     ) -> None:
         env = ImageExtractorWrapper(env)
         if frame_skip > 1:
@@ -34,6 +36,9 @@ class VizDoomWrapper(gym.Wrapper[np.ndarray, int, np.ndarray, int]):
         env = WarpFrame(env, width=screen_size, height=screen_size)
         if clip_reward:
             env = ClipRewardEnv(env)
+
+        if time_limit is not None:
+            env = TimeLimit(env, max_episode_steps=time_limit)
 
         super().__init__(env)
 
