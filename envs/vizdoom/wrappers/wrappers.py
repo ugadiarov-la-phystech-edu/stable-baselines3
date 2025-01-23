@@ -28,7 +28,7 @@ class VizDoomWrapper(gym.Wrapper[np.ndarray, int, np.ndarray, int]):
         frame_skip: int = 4,
         screen_size: int = 84,
         clip_reward: bool = True,
-        time_limit: int = 2099,
+        time_limit: int = None,
     ) -> None:
         env = ImageExtractorWrapper(env)
         if frame_skip > 1:
