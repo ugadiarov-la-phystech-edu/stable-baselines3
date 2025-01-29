@@ -8,6 +8,7 @@ import robosuite
 from robosuite import load_controller_config
 from robosuite.utils.placement_samplers import UniformRandomSampler, ObjectPositionSampler
 
+from stable_baselines3.common.env_util import make_vec_env
 
 ROBOSUITE_TASKS = {
     'lift': dict(
@@ -159,6 +160,10 @@ class RobosuiteEnv(gym.Env):
     def step(self, action):
         observation, reward, robosuite_done, info = self._env.step(action)
         return self._process_observation(observation), reward, robosuite_done, False, info
+
+
+def make_robosuite_env(*args, **kwargs):
+    return make_vec_env(*args, **kwargs)
 
 
 gymnasium.register(id='Robosuite/LiftMedium-v0', entry_point='envs.robosuite_env:RobosuiteEnv',
