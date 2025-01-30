@@ -1,5 +1,6 @@
 from typing import Any, ClassVar, Dict, Optional, Type, TypeVar, Union
 
+import numpy as np
 import torch as th
 from gymnasium import spaces
 from torch.nn import functional as F
@@ -86,6 +87,7 @@ class A2C(OnPolicyAlgorithm):
         policy_kwargs: Optional[Dict[str, Any]] = None,
         verbose: int = 0,
         seed: Optional[int] = None,
+        n_epochs: int = 1,
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
     ):
@@ -119,6 +121,7 @@ class A2C(OnPolicyAlgorithm):
         )
 
         self.normalize_advantage = normalize_advantage
+        self.n_epochs = n_epochs
 
         # Update optimizer inside the policy if we want to use RMSProp
         # (original implementation) rather than Adam
@@ -139,54 +142,69 @@ class A2C(OnPolicyAlgorithm):
 
         # Update optimizer learning rate
         self._update_learning_rate(self.policy.optimizer)
+        entropy_losses = []
+        policy_losses = []
+        value_losses = []
+        losses = []
+        grad_norms = []
 
-        # This will only loop once (get all data in one go)
-        for rollout_data in self.rollout_buffer.get(batch_size=None):
-            actions = rollout_data.actions
-            if isinstance(self.action_space, spaces.Discrete):
-                # Convert discrete action from float to long
-                actions = actions.long().flatten()
+        for _ in range(self.n_epochs):
+            # This will only loop once (get all data in one go)
+            for rollout_data in self.rollout_buffer.get(batch_size=None):
+                actions = rollout_data.actions
+                if isinstance(self.action_space, spaces.Discrete):
+                    # Convert discrete action from float to long
+                    actions = actions.long().flatten()
 
-            policy_result = self.policy.evaluate_actions(rollout_data.observations, actions)
-            values, log_prob, entropy = policy_result['values'], policy_result['log_probs'], policy_result['entropy']
-            values = values.flatten()
+                policy_result = self.policy.evaluate_actions(rollout_data.observations, actions)
+                values, log_prob, entropy = policy_result['values'], policy_result['log_probs'], policy_result['entropy']
+                values = values.flatten()
 
-            # Normalize advantage (not present in the original implementation)
-            advantages = rollout_data.advantages
-            if self.normalize_advantage:
-                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                # Normalize advantage (not present in the original implementation)
+                advantages = rollout_data.advantages
+                if self.normalize_advantage:
+                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-            # Policy gradient loss
-            policy_loss = -(advantages * log_prob).mean()
+                # Policy gradient loss
+                policy_loss = -(advantages * log_prob).mean()
+                policy_losses.append(policy_loss.item())
 
-            # Value loss using the TD(gae_lambda) target
-            value_loss = F.mse_loss(rollout_data.returns, values)
+                # Value loss using the TD(gae_lambda) target
+                value_loss = F.mse_loss(rollout_data.returns, values)
+                value_losses.append(value_loss.item())
 
-            # Entropy loss favor exploration
-            if entropy is None:
-                # Approximate entropy when no analytical form
-                entropy_loss = -th.mean(-log_prob)
-            else:
-                entropy_loss = -th.mean(entropy)
+                # Entropy loss favor exploration
+                if entropy is None:
+                    # Approximate entropy when no analytical form
+                    entropy_loss = -th.mean(-log_prob)
+                else:
+                    entropy_loss = -th.mean(entropy)
 
-            loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+                entropy_losses.append(entropy_loss.item())
 
-            # Optimization step
-            self.policy.optimizer.zero_grad()
-            loss.backward()
+                loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+                losses.append(loss.item())
 
-            # Clip grad norm
-            th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-            self.policy.optimizer.step()
+                # Optimization step
+                self.policy.optimizer.zero_grad()
+                loss.backward()
+
+                # Clip grad norm
+                grad_norm = th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                grad_norms.append(grad_norm.item())
+                self.policy.optimizer.step()
+
+            self._n_updates += 1
 
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
-        self._n_updates += 1
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         self.logger.record("train/explained_variance", explained_var)
-        self.logger.record("train/entropy_loss", entropy_loss.item())
-        self.logger.record("train/policy_loss", policy_loss.item())
-        self.logger.record("train/value_loss", value_loss.item())
+        self.logger.record("train/entropy_loss", np.mean(entropy_losses))
+        self.logger.record("train/policy_loss", np.mean(policy_losses))
+        self.logger.record("train/value_loss", np.mean(value_losses))
+        self.logger.record("train/loss", np.mean(losses))
+        self.logger.record("train/grad_norm", np.mean(grad_norms))
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
 
