@@ -145,7 +145,7 @@ class RobosuiteEnv(gym.Env):
         observation = np.flipud(observation[self._image_key_name])[self._crop[0][0]:self._crop[0][1],
                       self._crop[1][0]:self._crop[1][1]]
         self._last_frame = cv2.resize(observation, dsize=(self._obs_size, self._obs_size),
-                                      interpolation=cv2.INTER_CUBIC)
+                                      interpolation=cv2.INTER_AREA)
         return self._last_frame.copy()
 
     def render(self, *args, **kwargs):
