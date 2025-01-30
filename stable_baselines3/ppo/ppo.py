@@ -584,7 +584,7 @@ class PGPPO(PPO):
         for epoch in range(self.n_epochs):
             # Do a complete pass on the rollout buffer
             for rollout_data in self.rollout_buffer.get(self.batch_size):
-                with th.autocast(device_type=self.device.type, dtype=th.float16, enabled=True):
+                with th.autocast(device_type=self.device.type, dtype=th.float16, enabled=self.policy.use_half_precision):
                     actions = rollout_data.actions
                     if isinstance(self.action_space, spaces.Discrete):
                         # Convert discrete action from float to long
