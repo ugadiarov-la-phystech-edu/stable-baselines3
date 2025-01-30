@@ -468,6 +468,7 @@ class ActorCriticPolicy(BasePolicy):
         optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
         use_q_critic: Optional[bool] = False,
+        use_half_precision: Optional[bool] = True,
     ):
         if optimizer_kwargs is None:
             optimizer_kwargs = {}
@@ -538,6 +539,7 @@ class ActorCriticPolicy(BasePolicy):
 
         # Action distribution
         self.action_dist = make_proba_distribution(action_space, use_sde=use_sde, dist_kwargs=dist_kwargs)
+        self.use_half_precision = use_half_precision
 
         self._build(lr_schedule)
 
@@ -650,7 +652,7 @@ class ActorCriticPolicy(BasePolicy):
 
         # Setup optimizer with initial learning rate
         self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)  # type: ignore[call-arg]
-        self.scaler = th.cuda.amp.GradScaler(enabled=True)
+        self.scaler = th.cuda.amp.GradScaler(enabled=self.use_half_precision)
 
     def forward(self, obs: th.Tensor, deterministic: bool = False) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
@@ -899,6 +901,7 @@ class ActorCriticCnnPolicy(ActorCriticPolicy):
         optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
         use_q_critic: Optional[bool] = False,
+        use_half_precision: Optional[bool] = True,
     ):
         super().__init__(
             observation_space,
@@ -919,6 +922,7 @@ class ActorCriticCnnPolicy(ActorCriticPolicy):
             optimizer_class,
             optimizer_kwargs,
             use_q_critic,
+            use_half_precision=use_half_precision,
         )
 
 
@@ -975,6 +979,7 @@ class MultiInputActorCriticPolicy(ActorCriticPolicy):
         optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
         use_q_critic: Optional[bool] = False,
+        use_half_precision: Optional[bool] = True,
     ):
         super().__init__(
             observation_space,
@@ -995,6 +1000,7 @@ class MultiInputActorCriticPolicy(ActorCriticPolicy):
             optimizer_class,
             optimizer_kwargs,
             use_q_critic,
+            use_half_precision=use_half_precision,
         )
 
 
