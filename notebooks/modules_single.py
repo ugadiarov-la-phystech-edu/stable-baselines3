@@ -598,6 +598,92 @@ class ValueBaselineReinforce(Reinforce):
             ("train/baseline", baseline), ("train/value_loss", value_loss.item())
         ])
 
+########################################################################################
+
+class BatchedReturnBuffer(AverageReturnBuffer):
+    def __init__(self, observation_space: gym.spaces.Space, action_space: gym.spaces.Space, gamma: float = 0.99,
+                 device: Union[torch.device, str] = "cpu"):
+        super().__init__(observation_space, action_space, gamma, device)
+        self.generator_ready = None
+
+    def reset(self) -> None:
+        super().reset()
+        self.generator_ready = False
+
+    def get(self, batch_size: Optional[Union[int, float]] = None) -> Generator[BufferSamples, None, None]:
+        buffer_size = self.size()
+        indices = np.random.permutation(buffer_size)
+        if not self.generator_ready:
+            self.observations = np.asarray(self.observations)
+            self.actions = np.asarray(self.actions)
+            self.returns = np.asarray(self.returns, dtype=np.float32)
+            self.generator_ready = True
+
+        if batch_size is None or math.isinf(batch_size):
+            batch_size = buffer_size
+
+        start_idx = 0
+        while start_idx < buffer_size:
+            yield self._get_samples(indices[start_idx: start_idx + batch_size])
+            start_idx += batch_size
+
+
+class BatchedAverageReturnReinforce(Reinforce):
+    def __init__(self, env: gym.Env, learning_rate: float = 2.5e-4, gamma: float = 0.99, ent_coef: float = 0.001,
+                 max_grad_norm: float = 0.5, stats_window_size: int = 10, policy_class: Type[ReinforcePolicy] = ReinforcePolicy,
+                 policy_kwargs: Optional[Dict[str, Any]] = None, buffer_class: Type[BatchedReturnBuffer] = BatchedReturnBuffer,
+                 buffer_kwargs: Optional[Dict[str, Any]] = None, seed: Optional[int] = None,
+                 device: Union[torch.device, str] = "cuda", batch_size: Union[int, float] = 64, n_epochs: int = 1):
+        super().__init__(env, learning_rate, gamma, ent_coef, max_grad_norm, stats_window_size, policy_class, policy_kwargs,
+                         buffer_class, buffer_kwargs, seed, device)
+        self.batch_size = batch_size
+        self.n_epochs = n_epochs
+
+    def train(self) -> None:
+        self.policy.set_training_mode(True)
+
+        entropy_losses = []
+        entropies = []
+        pg_losses = []
+        losses = []
+        grad_norms = []
+        baseline = self.buffer.get_average_return()
+
+        for epoch in range(self.n_epochs):
+            for rollout_data in self.buffer.get(self.batch_size):
+                actions = rollout_data.actions.long()
+                features, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
+                advantages = rollout_data.returns - baseline
+
+                # Policy gradient loss
+                policy_loss = -(advantages * log_prob).mean()
+                pg_losses.append(policy_loss.item())
+
+                # Entropy loss
+                entropy = torch.mean(entropy)
+                entropy_loss = -self.ent_coef * entropy
+                entropies.append(entropy.item())
+                entropy_losses.append(entropy_loss.item())
+
+                loss = policy_loss + entropy_loss
+                losses.append(loss.item())
+
+                # Optimization step
+                self.policy.optimizer.zero_grad()
+                loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                grad_norms.append(grad_norm.item())
+                self.policy.optimizer.step()
+
+                self._n_updates += 1
+
+        self.log_dict = dict([
+            ("train/entropy_loss", np.mean(entropy_losses)), ("train/entropy", np.mean(entropies)),
+            ("train/policy_gradient_loss", np.mean(pg_losses)), ("train/loss", np.mean(losses)),
+            ("train/grad_norm", np.mean(grad_norms)), ("train/n_updates", self._n_updates),
+            ("train/baseline", baseline)
+        ])
+
 
 if __name__ == '__main__':
     # run_algorithm(
@@ -618,9 +704,18 @@ if __name__ == '__main__':
     #     log_interval=2,
     #     expected_return=2000,
     # )
+    # run_algorithm(
+    #     algorithm_class=ValueBaselineReinforce,
+    #     algorithm_kwargs=dict(seed=0, ),
+    #     use_wandb=False,
+    #     wandb_kwargs=dict(project='Test project', group='reinforce', monitor_gym=True, name='reinforce'),
+    #     max_timesteps=50000,
+    #     log_interval=2,
+    #     expected_return=2000,
+    # )
     run_algorithm(
-        algorithm_class=ValueBaselineReinforce,
-        algorithm_kwargs=dict(seed=0, ),
+        algorithm_class=BatchedAverageReturnReinforce,
+        algorithm_kwargs=dict(seed=0, batch_size=64, n_epochs=2),
         use_wandb=False,
         wandb_kwargs=dict(project='Test project', group='reinforce', monitor_gym=True, name='reinforce'),
         max_timesteps=50000,
