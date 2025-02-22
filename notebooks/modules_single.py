@@ -5,16 +5,18 @@ import sys
 import os
 import time
 from collections import deque
-from typing import Dict, Type, Any, Tuple, NamedTuple, Optional, Union, Generator, List
+from typing import Dict, Type, Any, Tuple, NamedTuple, Optional, Union, Generator, List, SupportsFloat
 
 import gymnasium as gym
-from gymnasium.vector import AsyncVectorEnv
+from gymnasium.core import WrapperActType, WrapperObsType
+from gymnasium.vector import AsyncVectorEnv, SyncVectorEnv, VectorEnv
 from gymnasium.wrappers import ResizeObservation, GrayScaleObservation, RecordEpisodeStatistics, NormalizeReward, \
-    FrameStack
+    FrameStack, TransformReward
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
+from gymnasium.wrappers.normalize import RunningMeanStd
 from torch import nn
 from torch.distributions import Categorical
 import vizdoom
@@ -93,22 +95,27 @@ class ImageExtractorWrapper(gym.ObservationWrapper):
         return observation['screen']
 
 
-def make_env(n_envs, env_id, kwargs=None):
-    kwargs = kwargs or {}
-    def _make():
-        env = gym.make(env_id, **kwargs)
-        env = ImageExtractorWrapper(env)
-        env = GrayScaleObservation(env)
-        env = ResizeObservation(env, shape=84)
-        env = FrameStack(env, num_stack=3)
-        env = RecordEpisodeStatistics(env)
+def make_env():
+    config_file_path = create_vizdoom_config()
+    env = gym.make('VizdoomCorridor-v0', **{'scenario_file': config_file_path})
+    env = ImageExtractorWrapper(env)
+    env = GrayScaleObservation(env)
+    env = ResizeObservation(env, shape=84)
+    env = FrameStack(env, num_stack=3)
+    env = RecordEpisodeStatistics(env)
+    env = TransformReward(env, f=lambda reward: reward / 100.)
 
-        return env
+    return env
 
-    vec_env = AsyncVectorEnv([_make for _ in range(n_envs)])
-    vec_env = NormalizeReward(vec_env)
 
-    return vec_env
+def set_seed_everywhere(seed: int, using_cuda: bool = False) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if using_cuda:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 class Encoder(nn.Module):
@@ -139,29 +146,30 @@ class Encoder(nn.Module):
         return self.linear(self.cnn(observations))
 
 
-class Policy(nn.Module):
+class ReinforcePolicy(nn.Module):
     def __init__(self, observation_space: gym.Space, action_space: gym.Space, lr: float,
-                 optimizer_class: Type[torch.optim.Optimizer] = torch.optim.Adam, optimizer_kwargs: Dict[str, Any] = {},):
+                 optimizer_class: Type[torch.optim.Optimizer] = torch.optim.RMSprop,
+                 optimizer_kwargs: Dict[str, Any] = {'eps': 1e-5},):
         super().__init__()
         self.observation_space = observation_space
         self.action_space = action_space
         self.lr = lr
         self.optimizer_class = optimizer_class
         self.optimizer_kwargs = dict(optimizer_kwargs)
-        if self.optimizer_class == torch.optim.Adam:
-            self.optimizer_kwargs["eps"] = self.optimizer_kwargs.get("eps", 1e-5)
-
         self.features_extractor = self.make_features_extractor()
-
         self.action_net = nn.Linear(self.features_extractor.features_dim, self.action_space.n)
-
         self.optimizer = self.optimizer_class(self.parameters(), lr=self.lr, **self.optimizer_kwargs)
 
     def make_features_extractor(self):
         return Encoder(self.observation_space)
 
-    def forward(self, obs: torch.Tensor, deterministic: bool = False) -> Tuple[
-        torch.Tensor, torch.Tensor]:
+    def extract_features(self, obs: torch.Tensor) -> torch.Tensor:
+        obs = obs.float() / 255.
+        features = self.features_extractor(obs)
+
+        return features
+
+    def forward(self, obs: torch.Tensor, deterministic: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
         features = self.extract_features(obs)
 
         action_logits = self.action_net(features)
@@ -171,22 +179,14 @@ class Policy(nn.Module):
 
         return actions
 
-    def extract_features(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        obs = obs.float() / 255.
-        features = self.features_extractor(obs)
-
-        return features
-
-    def evaluate_actions(self, obs: torch.Tensor, actions_taken: torch.Tensor) -> Tuple[
-        torch.Tensor, torch.Tensor]:
+    def evaluate_actions(self, obs: torch.Tensor, actions_taken: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         features = self.extract_features(obs)
-
         action_logits = self.action_net(features)
         distribution = Categorical(logits=action_logits)
         log_probs = distribution.log_prob(actions_taken)
         entropy = distribution.entropy()
 
-        return log_probs, entropy
+        return features, log_probs, entropy
 
     def set_training_mode(self, mode: bool) -> None:
         self.train(mode)
@@ -203,55 +203,37 @@ class Buffer:
             self,
             observation_space: gym.spaces.Space,
             action_space: gym.spaces.Space,
-            buffer_size: Optional[int] = None,
             gamma: float = 0.99,
-            n_envs: int = 1,
             device: Union[torch.device, str] = "cpu",
     ):
-        self.buffer_size = buffer_size
         self.observation_space = observation_space
         self.action_space = action_space
         self.obs_shape = self.observation_space.shape
         self.device = torch.device(device)
-        self.n_envs = n_envs
         self.gamma = gamma
-        self.full = None
-        self.generator_ready = None
         self.observations = None
         self.actions = None
         self.rewards = None
         self.returns = None
 
     def reset(self) -> None:
-        self.observations = [[] for _ in range(self.n_envs)]
-        self.actions = [[] for _ in range(self.n_envs)]
-        self.rewards = [[] for _ in range(self.n_envs)]
-        self.returns = [None for _ in range(self.n_envs)]
-        self.generator_ready = False
-        self.full = False
+        self.observations = []
+        self.actions = []
+        self.rewards = []
+        self.returns = None
 
     def size(self) -> int:
-        return sum(len(env_actions) for env_actions in self.actions)
-
-    @staticmethod
-    def swap_and_flatten(buffer: list) -> np.ndarray:
-        data = []
-        for env_data in buffer:
-            data.extend(env_data)
-
-        return np.stack(data)
+        return len(self.actions)
 
     def add(
             self,
             obs: np.ndarray,
-            action: np.ndarray,
-            reward: np.ndarray,
-            env_ids,
+            action: int,
+            reward: float,
     ) -> None:
-        for env_id in env_ids:
-            self.observations[env_id].append(obs[env_id])
-            self.actions[env_id].append(action[env_id])
-            self.rewards[env_id].append(reward[env_id])
+        self.observations.append(obs)
+        self.actions.append(action)
+        self.rewards.append(reward)
 
     def to_torch(self, array: np.ndarray) -> torch.Tensor:
         return torch.tensor(array, device=self.device)
@@ -260,94 +242,47 @@ class Buffer:
             self,
             batch_inds: np.ndarray,
     ) -> BufferSamples:
-        data = (
-            self.observations[batch_inds],
-            self.actions[batch_inds],
-            self.returns[batch_inds].flatten(),
-        )
-        return BufferSamples(*tuple(map(self.to_torch, data)))
+        observations = self.to_torch(self.observations[batch_inds])
+        actions = self.to_torch(self.actions[batch_inds])
+        returns = self.to_torch(self.returns[batch_inds])
 
-    def get(self, batch_size: Optional[Union[int, float]] = None) -> Generator[BufferSamples, None, None]:
+        return BufferSamples(observations=observations, actions=actions, returns=returns)
+
+    def get(self) -> BufferSamples:
         buffer_size = self.size()
         indices = np.random.permutation(buffer_size)
-        if not self.generator_ready:
-            _tensor_names = [
-                "observations",
-                "actions",
-                "returns",
-            ]
+        self.observations = np.asarray(self.observations)
+        self.actions = np.asarray(self.actions)
+        self.returns = np.asarray(self.returns, dtype=np.float32)
 
-            for tensor in _tensor_names:
-                self.__dict__[tensor] = self.swap_and_flatten(self.__dict__[tensor])
-            self.generator_ready = True
+        return self._get_samples(indices)
 
-        if batch_size is None or math.isinf(batch_size):
-            batch_size = buffer_size
+    def compute_returns(self) -> None:
+        returns = [None] * len(self.rewards)
+        reward_to_go = 0
+        for step in reversed(range(len(self.rewards))):
+            reward_to_go = self.rewards[step] + self.gamma * reward_to_go
+            returns[step] = reward_to_go
 
-        start_idx = 0
-        while start_idx < buffer_size:
-            yield self._get_samples(indices[start_idx: start_idx + batch_size])
-            start_idx += batch_size
-
-    def compute_returns_and_advantage(self) -> None:
-        for env_id in range(self.n_envs):
-            actions = self.actions[env_id]
-            rewards = self.rewards[env_id]
-            assert len(rewards) == len(actions)
-
-            returns = [None] * len(actions)
-            reward_to_go = 0
-            for step in reversed(range(len(actions))):
-                reward_to_go = rewards[step] + self.gamma * reward_to_go
-                returns[step] = reward_to_go
-
-            self.returns[env_id] = returns
+        self.returns = returns
 
 
-def set_seed_everywhere(seed: int, using_cuda: bool = False) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-    if using_cuda:
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-
-def run_algorithm(env_kwargs, algorithm_class, algorithm_kwargs, use_wandb, wandb_kwargs, total_timesteps, log_interval):
-    env = make_env(**env_kwargs)
-    model = algorithm_class(env, **algorithm_kwargs)
-    if use_wandb:
-        config = dict(env_kwargs)
-        config.update(algorithm_kwargs)
-        config.update(dict(algorithm_class=algorithm_class, total_timesteps=total_timesteps, log_interval=log_interval))
-        config.update(wandb_kwargs.get('config', {}))
-        wandb_kwargs['config'] = config
-        wandb.init(**wandb_kwargs)
-
-    model.learn(total_timesteps=total_timesteps, log_interval=log_interval)
-
-
-class MonteCarloActorCritic:
+class Reinforce:
     def __init__(
             self,
-            env,
-            learning_rate: float = 3e-4,
-            batch_size: Optional[int] = 64,
-            n_epochs: int = 10,
+            env: gym.Env,
+            learning_rate: float = 2.5e-4,
             gamma: float = 0.99,
-            gae_lambda: float = 0.95,
-            normalize_advantage: bool = True,
-            ent_coef: float = 0.0,
-            vf_coef: float = 0.5,
+            ent_coef: float = 0.001,
             max_grad_norm: float = 0.5,
-            stats_window_size: int = 100,
+            stats_window_size: int = 10,
+            policy_class: Type[ReinforcePolicy] = ReinforcePolicy,
             policy_kwargs: Optional[Dict[str, Any]] = None,
-            use_critic: Optional[bool] = True,
+            buffer_class: Type[Buffer] = Buffer,
+            buffer_kwargs: Optional[Dict[str, Any]] = None,
             seed: Optional[int] = None,
             device: Union[torch.device, str] = "cuda",
     ):
-        self.policy_class = Policy
         self.device = device if isinstance(device, torch.device) else torch.device(device)
         print(f"Using {self.device} device")
 
@@ -360,53 +295,43 @@ class MonteCarloActorCritic:
         self.start_time = 0.0
         self.learning_rate = learning_rate
         self._last_obs = None
-        self._last_episode_starts = None
         self._stats_window_size = stats_window_size
         self.ep_info_buffer = deque(maxlen=self._stats_window_size)
         self._n_updates = 0
 
-        self.observation_space = env.single_observation_space
-        self.action_space = env.single_action_space
-        self.n_envs = env.num_envs
+        self.observation_space = env.observation_space
+        self.action_space = env.action_space
         self.env = env
 
         self.n_steps = None
         self.gamma = gamma
-        self.gae_lambda = gae_lambda
         self.ent_coef = ent_coef
-        self.vf_coef = vf_coef
         self.max_grad_norm = max_grad_norm
-        self.batch_size = batch_size
-        self.n_epochs = n_epochs
-        self.normalize_advantage = normalize_advantage
         self.log_dict = {}
 
-        self.use_critic = use_critic
-
         self.set_random_seed(self.seed)
-        self.rollout_buffer = Buffer(
+        self.buffer_class = buffer_class
+        self.buffer_kwargs = {} if buffer_kwargs is None else buffer_kwargs
+        self.buffer = self.buffer_class(
             self.observation_space,
             self.action_space,
             device=self.device,
             gamma=self.gamma,
-            n_envs=self.n_envs,
+            **self.buffer_kwargs,
         )
+        self.policy_class = policy_class
         self.policy = self.policy_class(
             self.observation_space, self.action_space, self.learning_rate, **self.policy_kwargs
         )
         self.policy = self.policy.to(self.device)
 
-    def _update_info_buffer(self, infos: Dict[str, Any]) -> None:
+    def _update_info_buffer(self, info: Dict[str, Any]) -> None:
+        # Collect statistics
         assert self.ep_info_buffer is not None
 
-        if 'final_info' not in infos:
-            return
-
-        for idx, info in enumerate(infos['final_info']):
-            if info is not None:
-                maybe_ep_info = info.get("episode")
-                if maybe_ep_info is not None:
-                    self.ep_info_buffer.extend([maybe_ep_info])
+        ep_info = info.get("episode")
+        if ep_info is not None:
+            self.ep_info_buffer.append(ep_info)
 
     def set_random_seed(self, seed: Optional[int] = None) -> None:
         if seed is None:
@@ -419,92 +344,71 @@ class MonteCarloActorCritic:
             self,
             env,
             buffer: Buffer,
-    ) -> bool:
+    ):
         self.policy.set_training_mode(False)
         self._last_obs, _ = self.env.reset()
+        self._last_obs = np.array(self._last_obs)
         assert self._last_obs is not None, "No previous observation was provided"
 
         buffer.reset()
-        dones = np.full(shape=(env.num_envs,), fill_value=False)
-        while not dones.all().item():
+        terminated = False
+        while not terminated:
             with torch.no_grad():
                 obs_tensor = torch.as_tensor(self._last_obs, device=self.device)
-                actions = self.policy(obs_tensor)
-            actions = actions.cpu().numpy()
-            new_obs, rewards, terminated, truncated, infos = env.step(actions)
-            assert not np.any(truncated).item(), 'Episode truncation must be off'
+                action = self.policy(obs_tensor.unsqueeze(0))
+            action = action.item()
+            new_obs, reward, terminated, truncated, info = env.step(action)
+            assert not truncated, 'Episode truncation must be off as we want to use Monte Carlo estimation'
 
-            self.num_timesteps += env.num_envs - np.count_nonzero(dones)
-
-            new_dones = terminated & (~dones)
-            self._update_info_buffer(infos)
-            actions = actions.reshape(-1, 1)
-
-            self._episode_num += new_dones.sum().item()
-
+            self.num_timesteps += 1
+            self._episode_num += int(terminated)
             buffer.add(
                 self._last_obs,
-                actions,
-                rewards,
-                env_ids=np.nonzero(~dones)[0],
+                action,
+                reward,
             )
 
-            self._last_obs = new_obs
-            dones |= new_dones
-            self._last_episode_starts = dones
+            self._last_obs = np.array(new_obs)
+            self._update_info_buffer(info)
 
-        buffer.compute_returns_and_advantage()
-
-        return True
+        buffer.compute_returns()
 
     def train(self) -> None:
         self.policy.set_training_mode(True)
 
-        entropy_losses = []
-        entropies = []
-        pg_losses = []
-        losses = []
-        grad_norms = []
+        rollout_data = self.buffer.get()
+        actions = rollout_data.actions.long()
+        features, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
+        advantages = rollout_data.returns
 
-        for epoch in range(self.n_epochs):
-            for rollout_data in self.rollout_buffer.get(self.batch_size):
-                actions = rollout_data.actions.long().flatten()
-                log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
-                advantages = rollout_data.returns
-                if self.use_critic:
-                    advantages = rollout_data.advantages
+        # Policy gradient loss
+        policy_loss = -(advantages * log_prob).mean()
 
-                # Normalize advantage
-                if self.normalize_advantage and len(advantages) > 1:
-                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        # Entropy loss
+        entropy = torch.mean(entropy)
+        entropy_loss = -self.ent_coef * entropy
 
-                # Policy gradient loss
-                policy_loss = -(advantages * log_prob).mean()
-                pg_losses.append(policy_loss.item())
+        loss = policy_loss + entropy_loss
 
-                # Entropy loss
-                entropy = torch.mean(entropy)
-                entropies.append(entropy.item())
-                entropy_loss = -self.ent_coef * entropy
-                entropy_losses.append(entropy_loss.item())
+        # Optimization step
+        self.policy.optimizer.zero_grad()
+        loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+        self.policy.optimizer.step()
 
-                loss = policy_loss + entropy_loss
-                losses.append(loss.item())
-
-                # Optimization step
-                self.policy.optimizer.zero_grad()
-                loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-                grad_norms.append(grad_norm.item())
-                self.policy.optimizer.step()
-
-            self._n_updates += 1
+        self._n_updates += 1
 
         self.log_dict = dict([
-            ("train/entropy_loss", np.mean(entropy_losses)), ("train/entropy", np.mean(entropies)),
-            ("train/policy_gradient_loss", np.mean(pg_losses)), ("train/loss", np.mean(losses)),
-            ("train/grad_norm", np.mean(grad_norms)), ("train/n_updates", self._n_updates)
+            ("train/entropy_loss", entropy_loss.item()), ("train/entropy", entropy.item()),
+            ("train/policy_gradient_loss", policy_loss.item()), ("train/loss", loss.item()),
+            ("train/grad_norm", grad_norm.item()), ("train/n_updates", self._n_updates)
         ])
+
+    def get_current_mean_return(self) -> float:
+        if len(self.ep_info_buffer) == 0:
+            return -math.inf
+
+        return np.mean(np.concatenate([ep_info["r"] for ep_info in self.ep_info_buffer])).item()
 
     def _dump_logs(self, iteration: int) -> None:
         assert self.ep_info_buffer is not None
@@ -513,14 +417,12 @@ class MonteCarloActorCritic:
         fps = int((self.num_timesteps - self._num_timesteps_at_start) / time_elapsed)
         self.log_dict["time/iterations"] = iteration
         if len(self.ep_info_buffer) > 0 and len(self.ep_info_buffer[0]) > 0:
-            self.log_dict["rollout/ep_rew_mean"] = np.mean(
-                np.concatenate([ep_info["r"] for ep_info in self.ep_info_buffer])).item()
+            self.log_dict["rollout/ep_rew_mean"] = self.get_current_mean_return()
             self.log_dict["rollout/ep_len_mean"] = np.mean(
                 np.concatenate([ep_info["l"] for ep_info in self.ep_info_buffer])).item()
 
         self.log_dict["time/fps"] = fps
         self.log_dict["time/time_elapsed"] = int(time_elapsed)
-        self.log_dict["time/total_timesteps"] = self.num_timesteps
         self.log_dict["global_step"] = self.num_timesteps
         self.log_dict["num_episodes"] = self._episode_num
         print(json.dumps(self.log_dict, sort_keys=True, indent=4))
@@ -530,9 +432,10 @@ class MonteCarloActorCritic:
 
     def learn(
             self,
-            total_timesteps: int,
+            max_timesteps: int,
+            expected_return: float,
             log_interval: int = 1,
-    ):
+    ) -> None:
         assert self.env is not None
 
         self.start_time = time.time_ns()
@@ -542,15 +445,17 @@ class MonteCarloActorCritic:
 
         if self._last_obs is None:
             self._last_obs, _ = self.env.reset(seed=self.seed)
-            self._last_episode_starts = np.ones((self.env.num_envs,), dtype=bool)
 
         iteration = 0
-        while self.num_timesteps < total_timesteps:
-            continue_training = self.collect_rollouts(self.env, self.rollout_buffer,)
-
-            if not continue_training:
+        while True:
+            if self.get_current_mean_return() >= expected_return:
+                print('Решено!')
                 break
 
+            if self.num_timesteps >= max_timesteps:
+                print(f'Задача не решена за {max_timesteps} шагов')
+
+            self.collect_rollouts(self.env, self.buffer, )
             iteration += 1
 
             if log_interval is not None and iteration % log_interval == 0:
@@ -559,22 +464,166 @@ class MonteCarloActorCritic:
 
             self.train()
 
-        return self
+
+def run_algorithm(algorithm_class, algorithm_kwargs, use_wandb, wandb_kwargs, max_timesteps, log_interval, expected_return):
+    env = make_env()
+    model = algorithm_class(env, **algorithm_kwargs)
+    if use_wandb:
+        config = {}
+        config.update(algorithm_kwargs)
+        config.update(dict(algorithm_class=algorithm_class, max_timesteps=max_timesteps, log_interval=log_interval, expected_return=expected_return))
+        config.update(wandb_kwargs.get('config', {}))
+        wandb_kwargs['config'] = config
+        wandb.init(**wandb_kwargs)
+
+    model.learn(max_timesteps=max_timesteps, log_interval=log_interval, expected_return=expected_return)
+
+
+class AverageReturnBuffer(Buffer):
+    def __init__(self, observation_space: gym.spaces.Space, action_space: gym.spaces.Space, gamma: float = 0.99,
+                 device: Union[torch.device, str] = "cpu"):
+        super().__init__(observation_space, action_space, gamma, device)
+        self.n_returns = 0
+        self.average_return = 0
+
+    def get_average_return(self):
+        return self.average_return
+
+    def compute_returns(self) -> None:
+        super().compute_returns()
+        self.average_return = (self.average_return * self.n_returns + sum(self.returns)) / (self.n_returns + len(self.returns))
+        self.n_returns += len(self.returns)
+
+
+class AverageReturnReinforce(Reinforce):
+    def __init__(self, env: gym.Env, learning_rate: float = 2.5e-4, gamma: float = 0.99, ent_coef: float = 0.001,
+                 max_grad_norm: float = 0.5, stats_window_size: int = 10, policy_class: Type[ReinforcePolicy] = ReinforcePolicy,
+                 policy_kwargs: Optional[Dict[str, Any]] = None, buffer_class: Type[AverageReturnBuffer] = AverageReturnBuffer,
+                 buffer_kwargs: Optional[Dict[str, Any]] = None, seed: Optional[int] = None,
+                 device: Union[torch.device, str] = "cuda"):
+        super().__init__(env, learning_rate, gamma, ent_coef, max_grad_norm, stats_window_size, policy_class, policy_kwargs,
+                         buffer_class, buffer_kwargs, seed, device)
+
+    def train(self) -> None:
+        self.policy.set_training_mode(True)
+
+        rollout_data = self.buffer.get()
+        actions = rollout_data.actions.long()
+        features, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
+        baseline = self.buffer.get_average_return()
+        advantages = rollout_data.returns - baseline
+
+        # Policy gradient loss
+        policy_loss = -(advantages * log_prob).mean()
+
+        # Entropy loss
+        entropy = torch.mean(entropy)
+        entropy_loss = -self.ent_coef * entropy
+
+        loss = policy_loss + entropy_loss
+
+        # Optimization step
+        self.policy.optimizer.zero_grad()
+        loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+        self.policy.optimizer.step()
+
+        self._n_updates += 1
+
+        self.log_dict = dict([
+            ("train/entropy_loss", entropy_loss.item()), ("train/entropy", entropy.item()),
+            ("train/policy_gradient_loss", policy_loss.item()), ("train/loss", loss.item()),
+            ("train/grad_norm", grad_norm.item()), ("train/n_updates", self._n_updates),
+            ("train/baseline", baseline)
+        ])
+
+
+class ValuePolicy(ReinforcePolicy):
+    def __init__(self, observation_space: gym.Space, action_space: gym.Space, lr: float,
+                 optimizer_class: Type[torch.optim.Optimizer] = torch.optim.RMSprop,
+                 optimizer_kwargs: Dict[str, Any] = {'eps': 1e-5}):
+        super().__init__(observation_space, action_space, lr, optimizer_class, optimizer_kwargs)
+        self.value_net = nn.Linear(self.features_extractor.features_dim, 1)
+        self.optimizer = self.optimizer_class(self.parameters(), lr=self.lr, **self.optimizer_kwargs)
+
+    def evaluate_actions(self, obs: torch.Tensor, actions_taken: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        features, log_probs, entropy = super().evaluate_actions(obs, actions_taken)
+        values = self.value_net(features)
+
+        return features, log_probs, entropy, values
+
+
+class ValueBaselineReinforce(Reinforce):
+    def __init__(self, env: gym.Env, learning_rate: float = 2.5e-4, gamma: float = 0.99, ent_coef: float = 0.001,
+                 max_grad_norm: float = 0.5, stats_window_size: int = 10, policy_class: Type[ValuePolicy] = ValuePolicy,
+                 policy_kwargs: Optional[Dict[str, Any]] = None, buffer_class: Type[Buffer] = Buffer,
+                 buffer_kwargs: Optional[Dict[str, Any]] = None, seed: Optional[int] = None,
+                 device: Union[torch.device, str] = "cuda", vf_coef: float = 0.5,):
+        super().__init__(env, learning_rate, gamma, ent_coef, max_grad_norm, stats_window_size, policy_class,
+                         policy_kwargs, buffer_class, buffer_kwargs, seed, device)
+        self.vf_coef = vf_coef
+
+    def train(self) -> None:
+        self.policy.set_training_mode(True)
+
+        rollout_data = self.buffer.get()
+        actions = rollout_data.actions.long()
+        features, log_prob, entropy, values = self.policy.evaluate_actions(rollout_data.observations, actions)
+        advantages = rollout_data.returns - values.detach()
+        baseline = values.mean().item()
+
+        # Policy gradient loss
+        policy_loss = -(advantages * log_prob).mean()
+
+        # Entropy loss
+        entropy = torch.mean(entropy)
+        entropy_loss = -self.ent_coef * entropy
+
+        # Value loss
+        value_loss = self.vf_coef * F.mse_loss(values, rollout_data.returns.reshape_as(values))
+        loss = policy_loss + entropy_loss + value_loss
+
+        # Optimization step
+        self.policy.optimizer.zero_grad()
+        loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+        self.policy.optimizer.step()
+
+        self._n_updates += 1
+
+        self.log_dict = dict([
+            ("train/entropy_loss", entropy_loss.item()), ("train/entropy", entropy.item()),
+            ("train/policy_gradient_loss", policy_loss.item()), ("train/loss", loss.item()),
+            ("train/grad_norm", grad_norm.item()), ("train/n_updates", self._n_updates),
+            ("train/baseline", baseline), ("train/value_loss", value_loss.item())
+        ])
 
 
 if __name__ == '__main__':
-    config_file_path = create_vizdoom_config()
+    # run_algorithm(
+    #     algorithm_class=Reinforce,
+    #     algorithm_kwargs=dict(seed=0, ),
+    #     use_wandb=False,
+    #     wandb_kwargs=dict(project='Test project', group='reinforce', monitor_gym=True, name='reinforce'),
+    #     max_timesteps=50000,
+    #     log_interval=2,
+    #     expected_return=2000,
+    # )
+    # run_algorithm(
+    #     algorithm_class=AverageReturnReinforce,
+    #     algorithm_kwargs=dict(seed=0, ),
+    #     use_wandb=False,
+    #     wandb_kwargs=dict(project='Test project', group='reinforce', monitor_gym=True, name='reinforce'),
+    #     max_timesteps=50000,
+    #     log_interval=2,
+    #     expected_return=2000,
+    # )
     run_algorithm(
-        env_kwargs=dict(n_envs=1, env_id='VizdoomCorridor-v0', kwargs={'scenario_file': config_file_path}),
-        algorithm_class=MonteCarloActorCritic,
-        algorithm_kwargs=dict(learning_rate=2.5e-4, batch_size=math.inf, n_epochs=1, gamma=0.99,
-                              normalize_advantage=False, ent_coef=0.001, use_critic=False, seed=0,
-                              policy_kwargs={'optimizer_class': torch.optim.RMSprop, 'optimizer_kwargs': {'eps': 1e-5},},
-                              stats_window_size=10,
-                              ),
+        algorithm_class=ValueBaselineReinforce,
+        algorithm_kwargs=dict(seed=0, ),
         use_wandb=False,
-        wandb_kwargs=dict(project='Test project', group='montecarlo_actor-critic', monitor_gym=True,
-                          name='montecarlo_actor-critic'),
-        total_timesteps=100000,
+        wandb_kwargs=dict(project='Test project', group='reinforce', monitor_gym=True, name='reinforce'),
+        max_timesteps=50000,
         log_interval=2,
+        expected_return=2000,
     )
