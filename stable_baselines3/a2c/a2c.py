@@ -252,6 +252,7 @@ class MAC(A2C):
         policy_kwargs: Optional[Dict[str, Any]] = None,
         verbose: int = 0,
         seed: Optional[int] = None,
+        n_epochs: int = 1,
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
         detach_q_values: Optional[bool] = True,
@@ -282,6 +283,7 @@ class MAC(A2C):
             policy_kwargs,
             verbose,
             seed,
+            n_epochs,
             device,
             _init_setup_model,
         )
