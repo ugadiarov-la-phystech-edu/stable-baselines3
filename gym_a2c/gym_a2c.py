@@ -57,7 +57,7 @@ class Buffer:
         for env_data in buffer:
             data.extend(env_data)
 
-        return np.stack(data, dtype=dtype)
+        return np.stack(data).astype(dtype)
 
     def add(
             self,
