@@ -3,7 +3,10 @@ from typing import Any, ClassVar, Dict, Optional, Type, TypeVar, Union
 import numpy as np
 import torch
 import torch as th
+import gymnasium as gym
 from gymnasium import spaces
+from torch import nn
+from torch.distributions import Categorical
 from torch.nn import functional as F
 
 from stable_baselines3.common.buffers import RolloutBuffer
@@ -130,6 +133,133 @@ class Buffer:
             self.advantages[env_id] = advantages
 
 
+class Encoder(nn.Module):
+    def __init__(
+            self,
+            observation_space: gym.Space,
+            features_dim: int = 512,
+    ) -> None:
+        super().__init__()
+        self.features_dim = features_dim
+        n_input_channels = observation_space.shape[0]
+        self.cnn = nn.Sequential(
+            nn.Conv2d(n_input_channels, 32, kernel_size=8, stride=4, padding=0),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+
+        with torch.no_grad():
+            n_flatten = self.cnn(torch.as_tensor(observation_space.sample()[None]).float()).shape[1]
+
+        self.linear = nn.Sequential(nn.Linear(n_flatten, features_dim), nn.ReLU())
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        return self.linear(self.cnn(observations))
+
+
+class Policy(nn.Module):
+    def __init__(self,
+            observation_space: spaces.Space,
+            action_space: spaces.Space,
+            lr_schedule: Schedule,
+            net_arch=None,
+            activation_fn: Type[nn.Module] = nn.Tanh,
+            ortho_init: bool = True,
+            use_sde: bool = False,
+            log_std_init: float = 0.0,
+            full_std: bool = True,
+            use_expln: bool = False,
+            squash_output: bool = False,
+            features_extractor_class=None,
+            features_extractor_kwargs: Optional[Dict[str, Any]] = None,
+            share_features_extractor: bool = True,
+            normalize_images: bool = True,
+            optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
+            optimizer_kwargs: Optional[Dict[str, Any]] = {"eps": 1e-5},
+            use_q_critic: Optional[bool] = True,
+            use_half_precision: Optional[bool] = True,):
+        super().__init__()
+        self.observation_space = observation_space
+        self.action_space = action_space
+        self.lr = lr_schedule(1)
+        self.use_q_critic = use_q_critic
+        self.optimizer_class = optimizer_class
+        self.optimizer_kwargs = dict(optimizer_kwargs)
+        self.features_extractor = self.make_features_extractor()
+        self.features_dim = self.features_extractor.features_dim
+
+        self.action_net = nn.Linear(self.features_dim, self.action_space.n)
+        self.q_value_net = nn.Linear(self.features_dim, self.action_space.n)
+
+        self.optimizer = self.optimizer_class(self.parameters(), lr=self.lr, **self.optimizer_kwargs)
+
+    def make_features_extractor(self):
+        return Encoder(self.observation_space)
+
+    def forward(self, obs: torch.Tensor, deterministic: bool = False) -> Dict[str, torch.Tensor]:
+        features = self.extract_features(obs)
+        action_logits = self.action_net(features)
+        distribution = Categorical(logits=action_logits)
+        actions = distribution.mode() if deterministic else distribution.sample()
+        result = {'actions': actions, 'log_probs': distribution.log_prob(actions)}
+        if self.use_q_critic and isinstance(self.action_space, spaces.Discrete):
+            critic_output = self.q_value_net(features)
+            values = critic_output
+            result['q_values'] = values
+            result['values'] = th.bmm(values.unsqueeze(1), distribution.probs.unsqueeze(2)).squeeze(
+                dim=(1, 2))
+
+        return result
+
+    def extract_features(self, obs: torch.Tensor):
+        obs = obs.float() / 255.
+        features = self.features_extractor(obs)
+
+        return features
+
+    def evaluate_actions(self, obs: torch.Tensor, actions_taken: torch.Tensor) -> Dict[str, torch.Tensor]:
+        features = self.extract_features(obs)
+        action_logits = self.action_net(features)
+        distribution = Categorical(logits=action_logits)
+        entropy = distribution.entropy()
+        result = {'entropy': entropy}
+        if self.use_q_critic:
+            if isinstance(self.action_space, spaces.Discrete):
+                critic_output = self.q_value_net(features)
+                values = critic_output
+                result['q_values'] = values
+                result['probs'] = distribution.probs
+
+        return result
+
+    def predict(self, observation: np.ndarray,
+            state=None,
+            episode_start: Optional[np.ndarray] = None,
+            deterministic: bool = False,) -> th.Tensor:
+        device = None
+        for param in self.parameters():
+            device = param.device
+            break
+
+        observation = torch.as_tensor(observation, device=device)
+        if self.observation_space.shape == observation.shape[1:][::-1]:
+            observation = observation.movedim(-1, 1)
+
+        actions = self.forward(observation, deterministic=deterministic)['actions']
+        actions = actions.cpu().numpy().reshape((-1, *self.action_space.shape))
+        return actions, None
+
+    def predict_values(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.forward(obs)['values']
+
+    def set_training_mode(self, mode: bool) -> None:
+        self.train(mode)
+
+
 class A2C(OnPolicyAlgorithm):
     """
     Advantage Actor Critic (A2C)
@@ -178,6 +308,7 @@ class A2C(OnPolicyAlgorithm):
         "MlpPolicy": ActorCriticPolicy,
         "CnnPolicy": ActorCriticCnnPolicy,
         "MultiInputPolicy": MultiInputActorCriticPolicy,
+        "CustomPolicy": Policy,
     }
 
     def __init__(
