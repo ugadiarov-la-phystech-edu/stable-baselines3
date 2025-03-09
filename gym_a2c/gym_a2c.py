@@ -409,9 +409,9 @@ class MyMAC:
                     and infos[idx].get("terminal_observation") is not None
                     and infos[idx].get("TimeLimit.truncated", False)
                 ):
-                    terminal_obs = self.policy.obs_to_tensor(infos[idx]["terminal_observation"])[0]
+                    terminal_obs = torch.as_tensor(infos[idx]["terminal_observation"], device=self.device)
                     with th.no_grad():
-                        terminal_value = self.policy.predict_values(terminal_obs)[0]  # type: ignore[arg-type]
+                        terminal_value = self.policy.predict_values(terminal_obs.unsqueeze(0)).item()
                     rewards[idx] += self.gamma * terminal_value
 
             buffer.add(
