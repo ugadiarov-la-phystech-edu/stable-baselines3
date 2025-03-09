@@ -70,6 +70,7 @@ class A2C(OnPolicyAlgorithm):
         env: Union[GymEnv, str],
         learning_rate: Union[float, Schedule] = 7e-4,
         n_steps: int = 5,
+        batch_size: Optional[int] = None,
         gamma: float = 0.99,
         gae_lambda: float = 1.0,
         ent_coef: float = 0.0,
@@ -122,6 +123,7 @@ class A2C(OnPolicyAlgorithm):
 
         self.normalize_advantage = normalize_advantage
         self.n_epochs = n_epochs
+        self.batch_size = batch_size
 
         # Update optimizer inside the policy if we want to use RMSProp
         # (original implementation) rather than Adam
@@ -147,10 +149,14 @@ class A2C(OnPolicyAlgorithm):
         value_losses = []
         losses = []
         grad_norms = []
+        ratios = {}
+        fractions = {}
 
-        for _ in range(self.n_epochs):
+        for epoch in range(self.n_epochs):
+            ratios[epoch] = []
+            fractions[epoch] = {0.05: [], 0.10: [], 0.20: []}
             # This will only loop once (get all data in one go)
-            for rollout_data in self.rollout_buffer.get(batch_size=None):
+            for rollout_data in self.rollout_buffer.get(batch_size=self.batch_size):
                 actions = rollout_data.actions
                 if isinstance(self.action_space, spaces.Discrete):
                     # Convert discrete action from float to long
@@ -194,6 +200,14 @@ class A2C(OnPolicyAlgorithm):
                 grad_norms.append(grad_norm.item())
                 self.policy.optimizer.step()
 
+                # Log PPO-like ratio logging
+                ratio = th.exp(log_prob - rollout_data.old_log_prob)
+                for clip_range in fractions[epoch]:
+                    clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float()).item()
+                    fractions[epoch][clip_range].append(clip_fraction)
+
+                ratios[epoch].append(ratio.mean().item())
+
             self._n_updates += 1
 
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
@@ -207,6 +221,13 @@ class A2C(OnPolicyAlgorithm):
         self.logger.record("train/grad_norm", np.mean(grad_norms))
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
+
+        for epoch in ratios:
+            self.logger.record(f"train/ratio_epoch-{epoch}", np.mean(ratios[epoch]))
+
+        for epoch in fractions:
+            for ration_range in fractions[epoch]:
+                self.logger.record(f"train/fraction-{ration_range}_epoch-{epoch}", np.mean(fractions[epoch][ration_range]))
 
     def learn(
         self: SelfA2C,

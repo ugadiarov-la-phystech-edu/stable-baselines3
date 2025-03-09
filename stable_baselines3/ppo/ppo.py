@@ -202,10 +202,14 @@ class PPO(OnPolicyAlgorithm):
         pg_losses, value_losses = [], []
         clip_fractions = []
         grad_norms = []
+        ratios = {}
+        log_fractions = {}
 
         continue_training = True
         # train for n_epochs epochs
         for epoch in range(self.n_epochs):
+            ratios[epoch] = []
+            log_fractions[epoch] = {0.05: [], 0.10: [], 0.20: []}
             approx_kl_divs = []
             # Do a complete pass on the rollout buffer
             for rollout_data in self.rollout_buffer.get(self.batch_size):
@@ -240,6 +244,12 @@ class PPO(OnPolicyAlgorithm):
                     pg_losses.append(policy_loss.item())
                     clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float()).item()
                     clip_fractions.append(clip_fraction)
+
+                    for log_range in log_fractions[epoch]:
+                        fraction = th.mean((th.abs(ratio - 1) > log_range).float()).item()
+                        log_fractions[epoch][log_range].append(fraction)
+
+                    ratios[epoch].append(ratio.mean().item())
 
                     if self.clip_range_vf is None:
                         # No clipping
@@ -313,6 +323,13 @@ class PPO(OnPolicyAlgorithm):
         self.logger.record("train/clip_range", clip_range)
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
+
+        for epoch in ratios:
+            self.logger.record(f"train/ratio_epoch-{epoch}", np.mean(ratios[epoch]))
+
+        for epoch in log_fractions:
+            for ration_range in log_fractions[epoch]:
+                self.logger.record(f"train/fraction-{ration_range}_epoch-{epoch}", np.mean(log_fractions[epoch][ration_range]))
 
     def learn(
         self: SelfPPO,
