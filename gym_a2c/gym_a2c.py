@@ -453,7 +453,7 @@ class MyMAC:
         entropy = policy_output['entropy']
 
         # Policy gradient loss
-        policy_loss = -torch.mean(torch.bmm(q_values.unsqueeze(1).detach(), prob.unsqueeze(2)))
+        policy_loss = -self.pg_coef * torch.mean(torch.bmm(q_values.unsqueeze(1).detach(), prob.unsqueeze(2)))
 
         # Q-value loss
         q_values_taken = q_values.gather(1, actions.unsqueeze(1)).squeeze(dim=1)
