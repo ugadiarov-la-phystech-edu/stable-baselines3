@@ -490,7 +490,7 @@ class MyMAC:
         self.log_dict["global_step"] = self.num_timesteps
         self.log_dict["time/total_timesteps"] = self.num_timesteps
         self.log_dict["time/total_episodes"] = self._episode_num
-        print(json.dumps(self.log_dict, sort_keys=True, indent=4))
+        print(json.dumps(self.log_dict, sort_keys=True, indent=4), flush=True)
         if wandb.run is not None:
             wandb.log(self.log_dict)
 
