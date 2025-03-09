@@ -207,8 +207,11 @@ class Policy(nn.Module):
         self.use_q_critic = use_q_critic
         self.optimizer_class = optimizer_class
         self.optimizer_kwargs = dict(optimizer_kwargs)
+        self.share_features_extractor = share_features_extractor
         self.features_extractor = self.make_features_extractor()
         self.features_dim = self.features_extractor.features_dim
+        if not self.share_features_extractor:
+            self.v_features_extractor = self.make_features_extractor()
 
         self.action_net = nn.Linear(self.features_dim, self.action_space.n)
         self.q_value_net = nn.Linear(self.features_dim, self.action_space.n)
@@ -219,13 +222,13 @@ class Policy(nn.Module):
         return Encoder(self.observation_space)
 
     def forward(self, obs: torch.Tensor, deterministic: bool = False) -> Dict[str, torch.Tensor]:
-        features = self.extract_features(obs)
+        features, v_features = self.extract_features(obs)
         action_logits = self.action_net(features)
         distribution = Categorical(logits=action_logits)
         actions = distribution.mode() if deterministic else distribution.sample()
         result = {'actions': actions, 'log_probs': distribution.log_prob(actions)}
         if self.use_q_critic and isinstance(self.action_space, spaces.Discrete):
-            critic_output = self.q_value_net(features)
+            critic_output = self.q_value_net(v_features)
             values = critic_output
             result['q_values'] = values
             result['values'] = th.bmm(values.unsqueeze(1), distribution.probs.unsqueeze(2)).squeeze(
@@ -236,18 +239,21 @@ class Policy(nn.Module):
     def extract_features(self, obs: torch.Tensor):
         obs = obs.float() / 255.
         features = self.features_extractor(obs)
+        v_features = features
+        if not self.share_features_extractor:
+            v_features = self.v_features_extractor(obs)
 
-        return features
+        return features, v_features
 
     def evaluate_actions(self, obs: torch.Tensor, actions_taken: torch.Tensor) -> Dict[str, torch.Tensor]:
-        features = self.extract_features(obs)
+        features, v_features = self.extract_features(obs)
         action_logits = self.action_net(features)
         distribution = Categorical(logits=action_logits)
         entropy = distribution.entropy()
         result = {'entropy': entropy}
         if self.use_q_critic:
             if isinstance(self.action_space, spaces.Discrete):
-                critic_output = self.q_value_net(features)
+                critic_output = self.q_value_net(v_features)
                 values = critic_output
                 result['q_values'] = values
                 result['probs'] = distribution.probs
