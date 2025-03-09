@@ -397,12 +397,9 @@ class MyMAC:
             new_obs, rewards, dones, infos = env.step(actions)
 
             self.num_timesteps += env.num_envs
-
             self._update_info_buffer(infos, dones)
-            step += 1
-
-            actions = actions.reshape(-1, 1)
             self._episode_num += dones.sum().item()
+            actions = actions.reshape(-1, 1)
 
             # Handle timeout by bootstraping with value function
             # see GitHub issue #633
