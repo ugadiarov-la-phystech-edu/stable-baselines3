@@ -488,6 +488,7 @@ class MyMAC:
 
         self.log_dict["time/fps"] = fps
         self.log_dict["time/time_elapsed"] = int(time_elapsed)
+        self.log_dict["global_step"] = self.num_timesteps
         self.log_dict["time/total_timesteps"] = self.num_timesteps
         self.log_dict["time/total_episodes"] = self._episode_num
         print(json.dumps(self.log_dict, sort_keys=True, indent=4))
