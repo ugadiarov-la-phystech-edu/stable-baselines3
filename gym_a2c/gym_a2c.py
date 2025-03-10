@@ -13,8 +13,8 @@ import torch as th
 import gymnasium as gym
 import wandb
 from gymnasium import spaces
-from gymnasium.vector import SyncVectorEnv
-from gymnasium.wrappers import TimeLimit
+from gymnasium.vector import SyncVectorEnv, AsyncVectorEnv
+from gymnasium.wrappers import TimeLimit, RecordEpisodeStatistics, AtariPreprocessing, FrameStack
 from torch import nn
 from torch.distributions import Categorical
 from torch.nn import functional as F
@@ -1257,6 +1257,17 @@ class MAC(A2C):
         self.logger.record("train/value_loss", value_loss.item())
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
+
+
+def make_atari(env_id, n_envs):
+    def _make():
+        env = gym.make(env_id)
+        env = RecordEpisodeStatistics(env)
+        env = AtariPreprocessing(env)
+        env = FrameStack(env, num_stack=4)
+        return env
+
+    return AsyncVectorEnv([_make for _ in range(n_envs)])
 
 
 if __name__ == '__main__':
