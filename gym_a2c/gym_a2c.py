@@ -13,6 +13,8 @@ import torch as th
 import gymnasium as gym
 import wandb
 from gymnasium import spaces
+from gymnasium.vector import SyncVectorEnv
+from gymnasium.wrappers import TimeLimit
 from torch import nn
 from torch.distributions import Categorical
 from torch.nn import functional as F
@@ -591,6 +593,320 @@ class MyMAC:
             self.train()
 
 
+class MyMAC_Gymnasium:
+    def __init__(
+        self,
+        policy: Union[str, Type[ActorCriticPolicy]],
+        env: gym.vector.VectorEnv,
+        learning_rate: Union[float, Schedule] = 7e-4,
+        n_steps: int = 5,
+        gamma: float = 0.99,
+        gae_lambda: float = 1.0,
+        ent_coef: float = 0.0,
+        vf_coef: float = 0.5,
+        pg_coef: float = 1.0,
+        max_grad_norm: float = 0.5,
+        rms_prop_eps: float = 1e-5,
+        use_rms_prop: bool = True,
+        use_sde: bool = False,
+        sde_sample_freq: int = -1,
+        rollout_buffer_class: Optional[Type[RolloutBuffer]] = None,
+        rollout_buffer_kwargs: Optional[Dict[str, Any]] = None,
+        normalize_advantage: bool = False,
+        stats_window_size: int = 100,
+        tensorboard_log: Optional[str] = None,
+        policy_kwargs: Optional[Dict[str, Any]] = None,
+        verbose: int = 0,
+        seed: Optional[int] = None,
+        n_epochs: int = 1,
+        device: Union[th.device, str] = "cuda",
+        _init_setup_model: bool = True,
+        detach_q_values: Optional[bool] = True,
+        eval_env=None,
+        n_eval_episodes=None,
+        eval_interval=None,
+    ):
+        self.policy_class = Policy
+        self.device = device if isinstance(device, torch.device) else torch.device(device)
+        print(f"Using {self.device} device")
+
+        self.policy_kwargs = {} if policy_kwargs is None else policy_kwargs
+
+        self.num_timesteps = 0
+        self._num_timesteps_at_start = 0
+        self._episode_num = 0
+        self.seed = seed
+        self.start_time = 0.0
+        self.learning_rate = learning_rate
+        self._last_obs = None
+        self._last_episode_starts = None
+        self._stats_window_size = stats_window_size
+        self.ep_info_buffer = deque(maxlen=self._stats_window_size)
+        self._n_updates = 0
+
+        self.observation_space = env.single_observation_space
+        self.action_space = env.single_action_space
+        self.n_envs = env.num_envs
+        self.env = env
+        self.eval_env = eval_env
+        self.n_eval_episodes = n_eval_episodes
+        self.eval_interval = eval_interval or math.inf
+        self.next_eval_step = self.eval_interval
+
+        self.n_steps = n_steps
+        self.gamma = gamma
+        self.ent_coef = ent_coef
+        self.vf_coef = vf_coef
+        self.pg_coef = pg_coef
+        self.max_grad_norm = max_grad_norm
+        self.log_dict = {}
+        self.evaluation_history = {}
+        self.checkpoint_path = None
+
+        self.set_random_seed(self.seed)
+        self.rollout_buffer = Buffer(
+            buffer_size=None,
+            observation_space=self.observation_space,
+            action_space=self.action_space,
+            device=self.device,
+            gae_lambda=1,
+            gamma=self.gamma,
+            n_envs=self.n_envs,
+        )
+        self.policy = self.policy_class(
+            self.observation_space, self.action_space, self.learning_rate, **self.policy_kwargs
+        )
+        self.policy = self.policy.to(self.device)
+
+    def _update_info_buffer(self, infos: Dict[str, Any]) -> None:
+        assert self.ep_info_buffer is not None
+
+        if 'final_info' not in infos:
+            return
+
+        for idx, info in enumerate(infos['final_info']):
+            if info is not None:
+                maybe_ep_info = info.get("episode")
+                if maybe_ep_info is not None:
+                    self.ep_info_buffer.extend([maybe_ep_info])
+
+    def set_random_seed(self, seed: Optional[int] = None) -> None:
+        if seed is None:
+            return
+        set_seed_everywhere(seed, using_cuda=self.device.type == torch.device("cuda").type)
+        self.action_space.seed(seed)
+        self.observation_space.seed(seed)
+
+    def collect_rollouts(
+            self,
+            env,
+            buffer: Buffer,
+    ):
+        self.policy.set_training_mode(False)
+        assert self._last_obs is not None, "No previous observation was provided"
+
+        step = 0
+        buffer.reset()
+        while step < self.n_steps:
+            with torch.no_grad():
+                obs_tensor = torch.as_tensor(self._last_obs, device=self.device)
+                policy_result = self.policy(obs_tensor)
+                actions, values, log_probs = policy_result['actions'], policy_result['values'], policy_result['log_probs']
+            actions = actions.cpu().numpy()
+            new_obs, rewards, terminateds, truncateds, infos = env.step(actions)
+
+            self.num_timesteps += env.num_envs
+            self._update_info_buffer(infos)
+            dones = terminateds | truncateds
+            self._episode_num += np.sum(dones).item()
+            actions = actions.reshape(-1, 1)
+
+            # Handle timeout by bootstraping with value function
+            for idx, truncated in enumerate(truncateds):
+                if (
+                    truncated
+                    and "final_observation" in infos
+                    and infos["final_observation"][idx] is not None
+                ):
+                    terminal_obs = torch.as_tensor(infos["final_observation"][idx], device=self.device)
+                    with th.no_grad():
+                        terminal_value = self.policy.predict_values(terminal_obs.unsqueeze(0)).item()
+                    rewards[idx] += self.gamma * terminal_value
+
+            buffer.add(
+                self._last_obs,  # type: ignore[arg-type]
+                actions,
+                rewards,
+                self._last_episode_starts,  # type: ignore[arg-type]
+                values,
+                log_probs,
+            )
+            self._last_obs = new_obs  # type: ignore[assignment]
+            self._last_episode_starts = dones
+
+            if self.num_timesteps >= self.next_eval_step:
+                self.evaluate()
+                self.next_eval_step += self.eval_interval
+
+            step += 1
+
+        with torch.no_grad():
+            values = self.policy.predict_values(torch.as_tensor(new_obs, device=self.device))
+
+        buffer.compute_returns_and_advantage(last_values=values, dones=dones)
+
+    def train(self) -> None:
+        self.policy.set_training_mode(True)
+
+        rollout_data = self.rollout_buffer.get()[0]
+        actions = rollout_data.actions.long().flatten()
+        policy_output = self.policy.evaluate_actions(rollout_data.observations, actions)
+        prob = policy_output['probs']
+        q_values = policy_output['q_values']
+        entropy = policy_output['entropy']
+
+        # Policy gradient loss
+        policy_loss = -self.pg_coef * torch.mean(torch.bmm(q_values.unsqueeze(1).detach(), prob.unsqueeze(2)))
+
+        # Q-value loss
+        q_values_taken = q_values.gather(1, actions.unsqueeze(1)).squeeze(dim=1)
+        value_loss = self.vf_coef * F.mse_loss(q_values_taken, rollout_data.returns)
+
+        # Entropy loss
+        entropy = torch.mean(entropy)
+        entropy_loss = -self.ent_coef * entropy
+
+        loss = policy_loss + entropy_loss + value_loss
+
+        # Optimization step
+        self.policy.optimizer.zero_grad()
+        loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+        self.policy.optimizer.step()
+        self._n_updates += 1
+
+        self.log_dict = dict([
+            ("train/entropy_loss", entropy_loss.item()), ("train/policy_gradient_loss", policy_loss.item()),
+            ("train/value_loss", value_loss.item()), ("train/loss", loss.item()),
+            ("train/grad_norm", grad_norm.item()), ("train/n_updates", self._n_updates),
+            ("train/entropy", entropy.item()),
+        ])
+
+    def _dump_logs(self, iteration: int) -> None:
+        assert self.ep_info_buffer is not None
+
+        time_elapsed = max((time.time_ns() - self.start_time) / 1e9, sys.float_info.epsilon)
+        fps = int((self.num_timesteps - self._num_timesteps_at_start) / time_elapsed)
+        self.log_dict["time/iterations"] = iteration
+        if len(self.ep_info_buffer) > 0 and len(self.ep_info_buffer[0]) > 0:
+            self.log_dict["rollout/ep_rew_mean"] = np.mean(
+                np.asarray([ep_info["r"] for ep_info in self.ep_info_buffer])).item()
+            self.log_dict["rollout/ep_len_mean"] = np.mean(
+                np.asarray([ep_info["l"] for ep_info in self.ep_info_buffer])).item()
+
+        self.log_dict["time/fps"] = fps
+        self.log_dict["time/time_elapsed"] = int(time_elapsed)
+        self.log_dict["global_step"] = self.num_timesteps
+        self.log_dict["time/total_timesteps"] = self.num_timesteps
+        self.log_dict["time/total_episodes"] = self._episode_num
+        print(json.dumps(self.log_dict, sort_keys=True, indent=4), flush=True)
+        if wandb.run is not None:
+            wandb.log(self.log_dict)
+
+    def evaluate(self):
+        self.policy.set_training_mode(False)
+        if self.eval_env is None or self.n_eval_episodes is None:
+            return
+
+        n_eval_episodes = self.n_eval_episodes
+        eval_env = self.eval_env
+        n_envs = eval_env.num_envs
+        returns = []
+        lengths = []
+        episode_counts = np.zeros(n_envs, dtype=np.int32)
+        episode_count_targets = np.array([(n_eval_episodes + i) // n_envs for i in range(n_envs)], dtype=np.int32)
+        observations, _ = eval_env.reset()
+        while (episode_counts < episode_count_targets).any():
+            with torch.no_grad():
+                obs_tensor = torch.as_tensor(np.array(observations), device=self.device)
+                actions = self.policy(obs_tensor)['actions']
+            actions = actions.cpu().numpy()
+            new_observations, rewards, terminateds, truncateds, infos = eval_env.step(actions)
+            assert not truncateds.any().item(), 'Episode truncation must be off'
+
+            for i in range(n_envs):
+                if episode_counts[i] < episode_count_targets[i]:
+                    if terminateds[i]:
+                        assert 'final_info' in infos, 'Evaluation environments must be wrapped into RecordEpisodeStatistics'
+                        info = infos['final_info'][i]
+                        returns.append(info['episode']['r'].item())
+                        lengths.append(info['episode']['l'].item())
+                        episode_counts[i] += 1
+
+            observations = new_observations
+
+        assert len(returns) == n_eval_episodes
+        assert len(lengths) == n_eval_episodes
+
+        self.evaluation_history[self.num_timesteps] = {'returns': returns, 'lengths': lengths}
+        self.save_checkpoint()
+
+        log_eval_dict = {
+            'time/total_episodes': self.num_timesteps,
+            'eval/return': f'{np.mean(returns)} +/- {np.std(returns, ddof=1) / np.sqrt(len(returns))}',
+            'eval/length': f'{np.mean(lengths)} +/- {np.std(lengths, ddof=1) / np.sqrt(len(lengths))}',
+        }
+
+        print(json.dumps(log_eval_dict, sort_keys=True, indent=4))
+
+    def save_checkpoint(self):
+        if self.checkpoint_path is None:
+            print('Skip checkpoint saving')
+            return
+
+        checkpoint = {
+            'policy': self.policy.state_dict(), 'optimizer': self.policy.optimizer.state_dict(),
+            'num_timesteps': self.num_timesteps, 'episode_num': self._episode_num,
+            'ep_info_buffer': self.ep_info_buffer, 'evaluation_history': self.evaluation_history,
+        }
+        os.makedirs(self.checkpoint_path, exist_ok=True)
+        torch.save(checkpoint, os.path.join(self.checkpoint_path, 'checkpoint.pt'))
+        print(f'Save checkpoint to {self.checkpoint_path}')
+
+    def learn(
+            self,
+            total_timesteps: int,
+            log_interval: int = 1,
+            checkpoint_path: str = None,
+    ):
+        self.checkpoint_path = checkpoint_path
+        assert self.env is not None
+
+        self.start_time = time.time_ns()
+        self.num_timesteps = 0
+        self._episode_num = 0
+        self._num_timesteps_at_start = 0
+
+        if self._last_obs is None:
+            self._last_obs, _ = self.env.reset(seed=self.seed)
+            self._last_episode_starts = np.ones((self.env.num_envs,), dtype=bool)
+
+            if self.eval_env is not None:
+                self.eval_env.reset(seed=self.seed + self.n_envs)
+
+        iteration = 0
+        while self.num_timesteps < total_timesteps:
+            self.collect_rollouts(self.env, self.rollout_buffer)
+
+            iteration += 1
+
+            if log_interval is not None and iteration % log_interval == 0:
+                assert self.ep_info_buffer is not None
+                self._dump_logs(iteration)
+
+            self.train()
+
+
 class A2C(OnPolicyAlgorithm):
     """
     Advantage Actor Critic (A2C)
@@ -941,3 +1257,20 @@ class MAC(A2C):
         self.logger.record("train/value_loss", value_loss.item())
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
+
+
+if __name__ == '__main__':
+    def _make():
+        env = gym.make('PongNoFrameskip-v4')
+        t = random.randint(1, 50)
+        env = TimeLimit(env, t)
+        return env
+
+    env = SyncVectorEnv([_make for i in range(5)])
+    env.reset()
+    done = False
+    while not done:
+        o, r, term, trunc, infos = env.step(env.action_space.sample())
+        done = np.any(term | trunc).item()
+
+    print(trunc, infos.keys(), infos['final_info'])
