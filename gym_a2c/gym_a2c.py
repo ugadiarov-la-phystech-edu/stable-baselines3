@@ -852,12 +852,14 @@ class MyMAC_Gymnasium:
         self.save_checkpoint()
 
         log_eval_dict = {
-            'time/total_episodes': self.num_timesteps,
+            'time/total_timesteps': self.num_timesteps,
             'eval/return': f'{np.mean(returns)} +/- {np.std(returns, ddof=1) / np.sqrt(len(returns))}',
             'eval/length': f'{np.mean(lengths)} +/- {np.std(lengths, ddof=1) / np.sqrt(len(lengths))}',
         }
 
         print(json.dumps(log_eval_dict, sort_keys=True, indent=4))
+        if wandb.run is not None:
+            wandb.log(log_eval_dict)
 
     def save_checkpoint(self):
         if self.checkpoint_path is None:
