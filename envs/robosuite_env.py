@@ -1,11 +1,10 @@
 from copy import copy
 
 import cv2
-import gymnasium
 import gymnasium as gym
 import numpy as np
 import robosuite
-from robosuite import load_controller_config
+from robosuite import load_composite_controller_config
 from robosuite.utils.placement_samplers import UniformRandomSampler, ObjectPositionSampler
 
 from stable_baselines3.common.env_util import make_vec_env
@@ -60,16 +59,36 @@ class FixedPositionSampler(ObjectPositionSampler):
 class RobosuiteEnv(gym.Env):
     metadata = {"render_modes": ["rgb_array"]}
 
-    def __init__(self, task, horizon, obs_size):
+    def __init__(self, task, horizon, obs_type):
         assert task in ROBOSUITE_TASKS.keys(), f'Expected tasks={list(ROBOSUITE_TASKS.keys())}. Actual task={task}'
         task_cfg = ROBOSUITE_TASKS[task]
+        self._robot = 'Panda'
         self._task = task_cfg['env']
         self._horizon = horizon
-        self._obs_size = obs_size
+        self._obs_type = obs_type
         self._initialization_noise_magnitude = task_cfg['initialization_noise_magnitude']
         self._use_random_object_position = task_cfg['use_random_object_position']
         self.render_mode = self.metadata["render_modes"][0]
-        controller_config = load_controller_config(default_controller="OSC_POSITION")
+        self._camera_name = 'frontview'
+        self._image_key_name = f'{self._camera_name}_image'
+        self._controller_config = load_composite_controller_config(robot=self._robot)
+
+        self._env = self._make()
+        self._last_frame = None
+
+        obs = self._process_observation(self._env.reset())
+        if self._obs_type == 'rgb':
+            self.observation_space = gym.spaces.Box(0, 255, obs.shape, dtype=obs.dtype)
+        elif self._obs_type == 'state':
+            self.observation_space = gym.spaces.Box(-np.inf, np.inf, obs.shape, dtype=obs.dtype)
+
+        low, high = self._env.action_spec
+        self.action_space = gym.spaces.Box(low, high,)
+
+    def _make(self, seed=None):
+        if seed is not None:
+            np.random.seed(seed)
+
         placement_initializer = FixedPositionSampler("ObjectSampler", self._task)
         if self._use_random_object_position == 'large':
             placement_initializer = UniformRandomSampler(
@@ -109,51 +128,44 @@ class RobosuiteEnv(gym.Env):
         if self._initialization_noise_magnitude is not None:
             initialization_noise = {'magnitude': self._initialization_noise_magnitude, 'type': 'uniform'}
 
-        camera_name = 'frontview'
-        self._image_key_name = f'{camera_name}_image'
-        env = robosuite.make(
+        return robosuite.make(
             self._task,
-            robots=["Panda"],
+            robots=[self._robot],
             gripper_types="default",
-            controller_configs=controller_config,
+            controller_configs=self._controller_config,
             env_configuration="default",
             use_camera_obs=True,
-            use_object_obs=False,
+            use_object_obs=True,
             reward_shaping=True,
             has_renderer=False,
             has_offscreen_renderer=True,
             control_freq=20,
             horizon=self._horizon,
-            camera_names="frontview",
+            camera_names=self._camera_name,
             placement_initializer=placement_initializer,
             initialization_noise=initialization_noise,
-            camera_heights=256,
-            camera_widths=256,
+            camera_heights=224,
+            camera_widths=224,
             ignore_done=False,
         )
 
-        self._env = env
-        self._last_frame = None
-        self._crop = ((18, 202), (36, 220))
-        observation_space = (obs_size, obs_size, 3)
-        self.observation_space = gym.spaces.Box(0, 255, observation_space, dtype=np.uint8)
-
-        low, high = self._env.action_spec
-        self.action_space = gym.spaces.Box(low, high)
-
     def _process_observation(self, observation):
-        observation = np.flipud(observation[self._image_key_name])[self._crop[0][0]:self._crop[0][1],
-                      self._crop[1][0]:self._crop[1][1]]
-        self._last_frame = cv2.resize(observation, dsize=(self._obs_size, self._obs_size),
-                                      interpolation=cv2.INTER_AREA)
-        return self._last_frame.copy()
+        self._last_frame = np.flipud(observation[self._image_key_name])
+        if self._obs_type == 'rgb':
+            return self._last_frame.copy()
+        elif self._obs_type == 'state':
+            return np.concatenate([observation['robot0_proprio-state'], observation['object-state']], dtype=np.float32)
+        else:
+            raise ValueError(f'Unexpected observation type: {self._obs_type}')
 
     def render(self, *args, **kwargs):
         return self._last_frame.copy()
 
     def reset(self, seed=None, options=None):
         if seed is not None:
-            np.random.seed(seed)
+            self._env = self._make(seed)
+            self.action_space.seed(seed)
+            self.observation_space.seed(seed)
 
         return self._process_observation(self._env.reset()), {}
 
@@ -166,5 +178,16 @@ def make_robosuite_env(*args, **kwargs):
     return make_vec_env(*args, **kwargs)
 
 
-gymnasium.register(id='Robosuite/LiftMedium-v0', entry_point='envs.robosuite_env:RobosuiteEnv',
-                   kwargs=dict(task='lift-medium', horizon=125, obs_size=84))
+gym.register(id='Robosuite/LiftMediumRGB-v0', entry_point='envs.robosuite_env:RobosuiteEnv',
+                   kwargs=dict(task='lift-medium', horizon=125, obs_type='rgb', obs_size=84))
+
+gym.register(id='Robosuite/LiftMediumState-v0', entry_point='envs.robosuite_env:RobosuiteEnv',
+                   kwargs=dict(task='lift-medium', horizon=125, obs_type='state'))
+
+
+if __name__ == '__main__':
+    env = gym.make('Robosuite/LiftMediumState-v0')
+    o, _ = env.reset(seed=1)
+    print(o.shape)
+    for _ in range(5):
+        env.step(env.action_space.sample())
